@@ -22,6 +22,200 @@ except ImportError:
     COMFY_OUTPUT_DIR = os.path.join(os.path.dirname(CURRENT_DIR), "output")
 
 HYMOTION_MODELS_DIR = os.path.join(COMFY_MODELS_DIR, "HY-Motion")
+try:
+    folder_paths.add_model_folder_path("hymotion_gguf",
+        os.path.join(HYMOTION_MODELS_DIR, "ckpts", "GGUF"))
+    folder_paths.add_model_folder_path("hymotion_gguf",
+        os.path.join(COMFY_MODELS_DIR, "llm", "GGUF"))
+    folder_paths.add_model_folder_path("hymotion_gguf",
+        os.path.join(COMFY_MODELS_DIR, "LLM", "GGUF"))
+
+    if "hymotion_gguf" in folder_paths.folder_names_and_paths:
+        paths = folder_paths.folder_names_and_paths["hymotion_gguf"][0]
+        folder_paths.folder_names_and_paths["hymotion_gguf"] = (paths, {".gguf"})
+except Exception:
+    pass
+
+_BUILTIN_CONFIGS = {
+    "HY-Motion-1.0": {
+        "network_module": "hymotion/network/hymotion_mmdit.HunyuanMotionMMDiT",
+        "network_module_args": {
+            "apply_rope_to_single_branch": False, "ctxt_input_dim": 4096,
+            "dropout": 0.0, "feat_dim": 1280, "input_dim": 201,
+            "mask_mode": "narrowband", "mlp_ratio": 4.0,
+            "num_heads": 20, "num_layers": 27,
+            "time_factor": 1000.0, "vtxt_input_dim": 768,
+        },
+    },
+    "HY-Motion-1.0-Lite": {
+        "network_module": "hymotion/network/hymotion_mmdit.HunyuanMotionMMDiT",
+        "network_module_args": {
+            "apply_rope_to_single_branch": False, "ctxt_input_dim": 4096,
+            "dropout": 0.0, "feat_dim": 1024, "input_dim": 201,
+            "mask_mode": "narrowband", "mlp_ratio": 4.0,
+            "num_heads": 16, "num_layers": 18,
+            "time_factor": 1000.0, "vtxt_input_dim": 768,
+        },
+    },
+}
+
+_CLIP_VARIANTS = [
+    "clip-vit-large-patch14",
+    "clip-vit-large-patch 14",
+    "CLIP-ViT-L-14",
+    "clip-vit-large-patch14-v2",
+]
+
+
+def _find_clip_dir():
+    for variant in _CLIP_VARIANTS:
+        test_path = os.path.join(HYMOTION_MODELS_DIR, "ckpts", variant)
+        if os.path.exists(test_path):
+            return test_path
+
+    try:
+        for folder in folder_paths.get_folder_paths("text_encoders"):
+            if not os.path.exists(folder):
+                continue
+            for variant in _CLIP_VARIANTS:
+                test_path = os.path.join(folder, variant)
+                if os.path.exists(test_path):
+                    return test_path
+            for sub in os.listdir(folder):
+                sub_path = os.path.join(folder, sub)
+                if os.path.isdir(sub_path) and sub in _CLIP_VARIANTS:
+                    return sub_path
+    except Exception:
+        pass
+
+    try:
+        for folder in folder_paths.get_folder_paths("clip_vision"):
+            if not os.path.exists(folder):
+                continue
+            for variant in _CLIP_VARIANTS:
+                test_path = os.path.join(folder, variant)
+                if os.path.exists(test_path):
+                    return test_path
+    except Exception:
+        pass
+
+    return None
+
+
+def _scan_llm_dirs():
+    """Scan for Qwen3 LLM directories in multiple locations."""
+    found = []
+    seen = set()
+
+    def _add(name):
+        if name not in seen:
+            seen.add(name)
+            found.append(name)
+
+    qwen_dir = os.path.join(HYMOTION_MODELS_DIR, "ckpts")
+    if os.path.exists(qwen_dir):
+        for f in os.listdir(qwen_dir):
+            full_path = os.path.join(qwen_dir, f)
+            if os.path.isdir(full_path):
+                fl = f.lower()
+                if "qwen3" in fl or "qwen-3" in fl or "bnb-4bit" in fl or "awq" in fl:
+                    _add(f)
+
+    try:
+        llm_dir = os.path.join(COMFY_MODELS_DIR, "LLM")
+        if os.path.exists(llm_dir):
+            for f in os.listdir(llm_dir):
+                full_path = os.path.join(llm_dir, f)
+                if os.path.isdir(full_path):
+                    fl = f.lower()
+                    if "qwen3" in fl or "qwen-3" in fl:
+                        _add(f)
+    except Exception:
+        pass
+
+    return found
+
+
+def _scan_gguf_files():
+    """Scan for GGUF files using folder_paths (supports UI refresh + cache invalidation)."""
+    try:
+        return folder_paths.get_filename_list("hymotion_gguf")
+    except Exception:
+        found = []
+        for d in [
+            os.path.join(HYMOTION_MODELS_DIR, "ckpts", "GGUF"),
+            os.path.join(COMFY_MODELS_DIR, "llm", "GGUF"),
+            os.path.join(COMFY_MODELS_DIR, "LLM", "GGUF"),
+        ]:
+            if os.path.exists(d):
+                for root, _dirs, files in os.walk(d):
+                    for f in files:
+                        if f.lower().endswith(".gguf") and f not in found:
+                            found.append(f)
+        return found
+
+
+def _scan_hymotion_networks():
+    """Scan for HY-Motion network models in multiple locations.
+    Returns list of model names."""
+    found = []
+    seen = set()
+
+    tencent_dir = os.path.join(HYMOTION_MODELS_DIR, "ckpts", "tencent")
+    if os.path.exists(tencent_dir):
+        for name in os.listdir(tencent_dir):
+            model_dir = os.path.join(tencent_dir, name)
+            config_path = os.path.join(model_dir, "config.yml")
+            if os.path.isdir(model_dir) and os.path.exists(config_path):
+                if name not in seen:
+                    seen.add(name)
+                    found.append(name)
+
+    for folder_type in ("checkpoints", "diffusion_models"):
+        try:
+            for filename in folder_paths.get_filename_list(folder_type):
+                base = os.path.splitext(os.path.basename(filename))[0]
+                if base in _BUILTIN_CONFIGS and base not in seen:
+                    seen.add(base)
+                    found.append(base)
+        except Exception:
+            pass
+
+    return found
+
+
+def _resolve_network_model(model_name):
+    """Resolve a model name to (config_dict, ckpt_path, stats_dir).
+    Searches tencent directory first, then ComfyUI native folders."""
+    import yaml
+
+    model_dir = os.path.join(HYMOTION_MODELS_DIR, "ckpts", "tencent", model_name)
+    config_path = os.path.join(model_dir, "config.yml")
+    if os.path.exists(config_path):
+        with open(config_path, "r") as f:
+            config = yaml.load(f, Loader=yaml.FullLoader)
+        ckpt_path = os.path.join(model_dir, "latest.ckpt")
+        if not os.path.exists(ckpt_path):
+            ckpt_path = None
+        stats_dir = os.path.join(model_dir, "stats")
+        if not os.path.exists(stats_dir):
+            stats_dir = None
+        return config, ckpt_path, stats_dir
+
+    if model_name in _BUILTIN_CONFIGS:
+        config = _BUILTIN_CONFIGS[model_name]
+        for folder_type in ("checkpoints", "diffusion_models"):
+            try:
+                for filename in folder_paths.get_filename_list(folder_type):
+                    base = os.path.splitext(os.path.basename(filename))[0]
+                    if base == model_name:
+                        ckpt_path = folder_paths.get_full_path(folder_type, filename)
+                        if ckpt_path:
+                            return config, ckpt_path, None
+            except Exception:
+                pass
+
+    return None, None, None
 
 
 def get_timestamp():
@@ -91,32 +285,7 @@ class HYMotionLoadLLM:
     """Load Qwen3 LLM with quantization support"""
     @classmethod
     def INPUT_TYPES(s):
-        # Scan for available Qwen3 models
-        qwen_models = []
-        qwen_dir = os.path.join(HYMOTION_MODELS_DIR, "ckpts")
-        if os.path.exists(qwen_dir):
-            for f in os.listdir(qwen_dir):
-                full_path = os.path.join(qwen_dir, f)
-                if os.path.isdir(full_path) and ("qwen3" in f.lower() or "qwen-3" in f.lower()):
-                    qwen_models.append(f)
-                # Also include bnb-4bit and awq models
-                elif os.path.isdir(full_path) and ("bnb-4bit" in f.lower() or "awq" in f.lower()):
-                    qwen_models.append(f)
-        
-        # Add support for specific models
-        # Check for Qwen3-8B-bnb-4bit
-        bnb_model_path = os.path.join(HYMOTION_MODELS_DIR, "ckpts", "Qwen3-8B-bnb-4bit")
-        if os.path.exists(bnb_model_path):
-            if "Qwen3-8B-bnb-4bit" not in qwen_models:
-                qwen_models.append("Qwen3-8B-bnb-4bit")
-        
-        # Check for Qwen3-8B-AWQ
-        awq_model_path = os.path.join(HYMOTION_MODELS_DIR, "ckpts", "Qwen3-8B-AWQ")
-        if os.path.exists(awq_model_path):
-            if "Qwen3-8B-AWQ" not in qwen_models:
-                qwen_models.append("Qwen3-8B-AWQ")
-        
-        # Default to Qwen3-8B if no models found
+        qwen_models = _scan_llm_dirs()
         if not qwen_models:
             qwen_models = ["Qwen3-8B"]
         
@@ -137,9 +306,20 @@ class HYMotionLoadLLM:
         from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
         from .hymotion.network.text_encoders.model_constants import PROMPT_TEMPLATE_ENCODE_HUMAN_MOTION
 
+        # Search multiple locations for LLM directory
         local_path = os.path.join(HYMOTION_MODELS_DIR, "ckpts", model_name)
         if not os.path.exists(local_path):
-            raise FileNotFoundError(f"LLM directory not found: {local_path}. Please download the {model_name} model first and place it in the HY-Motion models directory.")
+            # Try ComfyUI native LLM folder
+            alt_path = os.path.join(COMFY_MODELS_DIR, "LLM", model_name)
+            if os.path.exists(alt_path):
+                local_path = alt_path
+            else:
+                raise FileNotFoundError(
+                    f"LLM directory not found. Searched:\n"
+                    f"  1. {os.path.join(HYMOTION_MODELS_DIR, 'ckpts', model_name)}\n"
+                    f"  2. {alt_path}\n"
+                    f"Please download {model_name} and place it in either location."
+                )
 
         print(f"[HY-Motion] Loading LLM: {local_path}, quantization={quantization}, offload_to_cpu={offload_to_cpu}")
 
@@ -245,19 +425,7 @@ class HYMotionLoadLLMGGUF:
 
     @classmethod
     def INPUT_TYPES(s):
-        # Scan for GGUF files
-        gguf_files = ["(select file)"]
-        gguf_dir = os.path.join(HYMOTION_MODELS_DIR, "ckpts", "GGUF")
-        if os.path.exists(gguf_dir):
-            for f in os.listdir(gguf_dir):
-                if f.endswith(".gguf"):
-                    gguf_files.append(f)
-
-        llm_gguf_dir = os.path.join(COMFY_MODELS_DIR, "llm", "GGUF")
-        if os.path.exists(llm_gguf_dir):
-            for f in os.listdir(llm_gguf_dir):
-                if f.endswith(".gguf"):
-                    gguf_files.append(f"llm/GGUF/{f}")
+        gguf_files = ["(select file)"] + _scan_gguf_files()
 
         return {
             "required": {
@@ -304,18 +472,23 @@ class HYMotionLoadLLMGGUF:
         if gguf_file == "(select file)":
             raise ValueError("Please select a GGUF file")
 
-        if gguf_file.startswith("llm/GGUF/"):
-            gguf_dir = os.path.join(COMFY_MODELS_DIR, "llm", "GGUF")
-            gguf_filename = os.path.basename(gguf_file)
-        else:
-            gguf_dir = os.path.join(HYMOTION_MODELS_DIR, "ckpts", "GGUF")
-            gguf_filename = gguf_file
+        # Use folder_paths to resolve the file (handles all registered search paths)
+        gguf_path = None
+        try:
+            gguf_path = folder_paths.get_full_path("hymotion_gguf", gguf_file)
+        except Exception:
+            pass
 
-        os.makedirs(gguf_dir, exist_ok=True)
-        gguf_path = os.path.join(gguf_dir, gguf_filename)
+        if not gguf_path or not os.path.exists(gguf_path):
+            raise FileNotFoundError(
+                f"GGUF file not found: {gguf_file}\n"
+                f"Searched locations:\n"
+                f"  1. {os.path.join(HYMOTION_MODELS_DIR, 'ckpts', 'GGUF')}\n"
+                f"  2. {os.path.join(COMFY_MODELS_DIR, 'llm', 'GGUF')}\n"
+                f"  3. {os.path.join(COMFY_MODELS_DIR, 'LLM', 'GGUF')}"
+            )
 
-        if not os.path.exists(gguf_path):
-            raise FileNotFoundError(f"GGUF file not found: {gguf_path}\nPlease place your GGUF file in {gguf_dir}")
+        gguf_dir = os.path.dirname(gguf_path)
 
         print(f"[HY-Motion] Loading LLM from GGUF: {gguf_path}, device_strategy={device_strategy}")
         tokenizer = None
@@ -873,9 +1046,13 @@ class HYMotionLoadNetwork:
     """Load Motion Diffusion Network"""
     @classmethod
     def INPUT_TYPES(s):
+        model_names = _scan_hymotion_networks()
+        if not model_names:
+            model_names = ["HY-Motion-1.0", "HY-Motion-1.0-Lite"]
+        default = "HY-Motion-1.0-Lite" if "HY-Motion-1.0-Lite" in model_names else model_names[0]
         return {
             "required": {
-                "model_name": (["HY-Motion-1.0", "HY-Motion-1.0-Lite"], {"default": "HY-Motion-1.0-Lite"}),
+                "model_name": (model_names, {"default": default}),
             },
         }
 
@@ -885,21 +1062,19 @@ class HYMotionLoadNetwork:
     CATEGORY = "HY-Motion/Loaders"
 
     def load_network(self, model_name):
-        import yaml
         from .hymotion.utils.loaders import load_object
         from .hymotion.pipeline.body_model import WoodenMesh
 
-        model_dir = os.path.join(HYMOTION_MODELS_DIR, "ckpts", "tencent", model_name)
-        config_path = os.path.join(model_dir, "config.yml")
-        ckpt_path = os.path.join(model_dir, "latest.ckpt")
+        config, ckpt_path, stats_dir = _resolve_network_model(model_name)
 
-        if not os.path.exists(config_path):
-            raise FileNotFoundError(f"Config not found: {config_path}")
+        if config is None:
+            raise FileNotFoundError(
+                f"Model '{model_name}' not found. Place models in:\n"
+                f"  1. {os.path.join(HYMOTION_MODELS_DIR, 'ckpts', 'tencent', model_name)}/ (with config.yml + latest.ckpt)\n"
+                f"  2. ComfyUI checkpoints folder as {model_name}.ckpt"
+            )
 
-        print(f"[HY-Motion] Loading network: {config_path}")
-
-        with open(config_path, "r") as f:
-            config = yaml.load(f, Loader=yaml.FullLoader)
+        print(f"[HY-Motion] Loading network: {model_name}")
 
         network = load_object(config["network_module"], config["network_module_args"])
         network.eval()
@@ -910,7 +1085,7 @@ class HYMotionLoadNetwork:
         null_vtxt_feat = torch.randn(1, 1, 768)
         null_ctxt_input = torch.randn(1, 1, 4096)
 
-        if os.path.exists(ckpt_path):
+        if ckpt_path and os.path.exists(ckpt_path):
             print(f"[HY-Motion] Loading checkpoint: {ckpt_path}")
             checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
             state_dict = checkpoint["model_state_dict"]
@@ -925,8 +1100,7 @@ class HYMotionLoadNetwork:
             null_ctxt_input = state_dict.get("null_ctxt_input", null_ctxt_input)
 
         # Load from stats directory
-        stats_dir = os.path.join(model_dir, "stats")
-        if not os.path.exists(stats_dir):
+        if stats_dir is None or not os.path.exists(stats_dir):
             stats_dir = os.path.join(CURRENT_DIR, "HY-Motion-1.0", "stats")
         if os.path.exists(stats_dir):
             mean_path = os.path.join(stats_dir, "Mean.npy")
@@ -1057,27 +1231,22 @@ class HYMotionEncodeText:
             from transformers import CLIPTextModel, CLIPTokenizer
             print("[HY-Motion] Loading CLIP (clip-vit-large-patch14)")
 
-            # 尝试不同的CLIP模型目录名称变体
-            clip_variants = [
-                "clip-vit-large-patch14",  # 标准名称（无空格）
-                "clip-vit-large-patch 14",  # 带空格的变体
-                "CLIP-ViT-L-14",  # Hugging Face官方名称
-                "clip-vit-large-patch14-v2"  # v2版本
-            ]
-            
-            local_path = None
-            for variant in clip_variants:
-                test_path = os.path.join(HYMOTION_MODELS_DIR, "ckpts", variant)
-                if os.path.exists(test_path):
-                    local_path = test_path
-                    print(f"[HY-Motion] Found CLIP model at: {local_path}")
-                    break
-            
+            local_path = _find_clip_dir()
+
             if not local_path:
-                # 如果所有变体都不存在，显示更详细的错误信息
-                expected_paths = [os.path.join(HYMOTION_MODELS_DIR, "ckpts", variant) for variant in clip_variants]
-                paths_str = "\n- ".join([""] + expected_paths)
-                raise FileNotFoundError(f"CLIP directory not found. Please download the clip-vit-large-patch14 model first and place it in one of these locations:{paths_str}")
+                search_locations = [os.path.join(HYMOTION_MODELS_DIR, "ckpts")]
+                try:
+                    search_locations.extend(folder_paths.get_folder_paths("text_encoders"))
+                except Exception:
+                    pass
+                locations_str = "\n- ".join([""] + search_locations)
+                raise FileNotFoundError(
+                    f"CLIP directory not found. Please download clip-vit-large-patch14 "
+                    f"and place it in one of these locations:{locations_str}\n"
+                    f"Supported directory names: {', '.join(_CLIP_VARIANTS)}"
+                )
+
+            print(f"[HY-Motion] Found CLIP model at: {local_path}")
 
             HYMotionEncodeText._clip_tokenizer = CLIPTokenizer.from_pretrained(local_path, max_length=77, local_files_only=True)
             HYMotionEncodeText._clip_model = CLIPTextModel.from_pretrained(local_path, local_files_only=True)
