@@ -874,8 +874,10 @@ def apply_retargeted_animation(scene, skeleton, ret_rots, ret_locs, fstart, fend
             cx = node.LclRotation.GetCurve(layer, "X", True)
             cy = node.LclRotation.GetCurve(layer, "Y", True)
             cz = node.LclRotation.GetCurve(layer, "Z", True)
-            cx.KeyModifyBegin(); cy.KeyModifyBegin(); cz.KeyModifyBegin()
-            
+            cx.KeyModifyBegin()
+            cy.KeyModifyBegin()
+            cz.KeyModifyBegin()
+
             for f, q_local in ret_rots[name].items():
                 t = FbxTime()
                 t.SetFrame(f, tmode)
@@ -895,14 +897,18 @@ def apply_retargeted_animation(scene, skeleton, ret_rots, ret_locs, fstart, fend
                     idx = c.KeyAdd(t)[0]
                     c.KeySetValue(idx, float(val))
                     c.KeySetInterpolation(idx, fbx.FbxAnimCurveDef.EInterpolationType.eInterpolationLinear)
-            cx.KeyModifyEnd(); cy.KeyModifyEnd(); cz.KeyModifyEnd()
-            
+            cx.KeyModifyEnd()
+            cy.KeyModifyEnd()
+            cz.KeyModifyEnd()
+
         if name in ret_locs:
             node.LclTranslation.ModifyFlag(fbx.FbxPropertyFlags.EFlags.eAnimatable, True)
             tx = node.LclTranslation.GetCurve(layer, "X", True)
             ty = node.LclTranslation.GetCurve(layer, "Y", True)
             tz = node.LclTranslation.GetCurve(layer, "Z", True)
-            tx.KeyModifyBegin(); ty.KeyModifyBegin(); tz.KeyModifyBegin()
+            tx.KeyModifyBegin()
+            ty.KeyModifyBegin()
+            tz.KeyModifyBegin()
             for f, loc in ret_locs[name].items():
                 t = FbxTime()
                 t.SetFrame(f, tmode)
@@ -910,9 +916,12 @@ def apply_retargeted_animation(scene, skeleton, ret_rots, ret_locs, fstart, fend
                     idx = c.KeyAdd(t)[0]
                     c.KeySetValue(idx, float(val))
                     c.KeySetInterpolation(idx, fbx.FbxAnimCurveDef.EInterpolationType.eInterpolationLinear)
-            tx.KeyModifyEnd(); ty.KeyModifyEnd(); tz.KeyModifyEnd()
-            
-        for i in range(node.GetChildCount()): apply_node(node.GetChild(i))
+            tx.KeyModifyEnd()
+            ty.KeyModifyEnd()
+            tz.KeyModifyEnd()
+
+        for i in range(node.GetChildCount()):
+            apply_node(node.GetChild(i))
     apply_node(scene.GetRootNode())
 
 def retarget_animation(src_skel: Skeleton, tgt_skel: Skeleton, mapping: dict[str, str], force_scale: float = 0.0, yaw_offset: float = 0.0, neutral_fingers: bool = True):
