@@ -489,6 +489,7 @@ class HYMotionLoadLLMGGUF:
             )
 
         gguf_dir = os.path.dirname(gguf_path)
+        gguf_filename = os.path.basename(gguf_path)
 
         print(f"[HY-Motion] Loading LLM from GGUF: {gguf_path}, device_strategy={device_strategy}")
         tokenizer = None
