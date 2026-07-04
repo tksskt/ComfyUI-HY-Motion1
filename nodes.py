@@ -1372,7 +1372,30 @@ class HYMotionEncodeText:
         from .hymotion.network.text_encoders.model_constants import PROMPT_TEMPLATE_ENCODE_HUMAN_MOTION
 
         requested_device = device
-        clip_device = self._ensure_clip_loaded(requested_device)
+        llm_device_hint = getattr(llm, "device", None)
+        if requested_device in (None, "", "default"):
+            if llm_device_hint is not None:
+                device = _resolve_device(llm_device_hint)
+                inherited_from = "llm.device"
+            else:
+                device = model_management.get_torch_device()
+                inherited_from = "model_management.get_torch_device"
+        else:
+            device = _resolve_device(requested_device)
+            inherited_from = "explicit"
+            if llm_device_hint is not None:
+                inherited_llm_device = _resolve_device(llm_device_hint)
+                if inherited_llm_device != device:
+                    print(
+                        f"[HY-Motion] Encode Text requested_device={requested_device} "
+                        f"llm_device={inherited_llm_device} warning=device mismatch; "
+                        "using explicit Encode Text device"
+                    )
+        print(
+            f"[HY-Motion] Encode Text requested_device={requested_device} "
+            f"inherited_from={inherited_from} resolved_device={device}"
+        )
+        clip_device = self._ensure_clip_loaded(device)
 
         text_list = [text]
         device = clip_device
@@ -1436,7 +1459,7 @@ class HYMotionEncodeText:
             # 删除转换层以释放内存
             del conversion_layer
         
-        print(f"[HY-Motion] Encode Text requested_device={requested_device} clip_device={clip_device} llm_device={llm_device} vtxt={vtxt_raw.shape} ctxt={ctxt_raw.shape}")
+        print(f"[HY-Motion] Encode Text clip_device={clip_device} llm_device={llm_device} vtxt={vtxt_raw.shape} ctxt={ctxt_raw.shape}")
         return (HYMotionConditioning(vtxt_raw, ctxt_raw, ctxt_length, text_list),)
 
 
@@ -1477,11 +1500,31 @@ class HYMotionGenerate:
         network_device = getattr(network, "device", None)
         if network_device is not None:
             device = _resolve_device(network_device)
+            inherited_from = "network.device"
+            if requested_device not in (None, "", "default"):
+                try:
+                    explicit_device = _resolve_device(requested_device)
+                    if explicit_device != device:
+                        print(
+                            f"[HY-Motion] Generate requested_device={requested_device} "
+                            f"network_device={device} warning=device mismatch; using network.device"
+                        )
+                except Exception as e:
+                    print(
+                        f"[HY-Motion] Generate requested_device={requested_device} "
+                        f"network_device={device} warning=invalid explicit device; using network.device ({e})"
+                    )
         elif requested_device not in (None, "", "default"):
             device = _resolve_device(requested_device)
+            inherited_from = "explicit"
         else:
             device = model_management.get_torch_device()
-        print(f"[HY-Motion] Generate device={device}, requested_device={requested_device}, network_device={network_device}")
+            inherited_from = "model_management.get_torch_device"
+        print(
+            f"[HY-Motion] Generate requested_device={requested_device} "
+            f"inherited_from={inherited_from} resolved_device={device}"
+        )
+        print(f"[HY-Motion] Generate device={device}")
 
         network.network = network.network.to(device)
         network.mean = network.mean.to(device)
