@@ -223,26 +223,89 @@ def get_timestamp():
     ms = int((t - int(t)) * 1000)
     return time.strftime("%Y%m%d_%H%M%S", time.localtime(t)) + f"{ms:03d}"
 
+def _get_device_choices(include_cpu=True):
+    choices = ["default"]
+    if include_cpu:
+        choices.append("cpu")
+    if torch.cuda.is_available():
+        try:
+            choices.extend(f"cuda:{i}" for i in range(torch.cuda.device_count()))
+        except Exception:
+            pass
+    return choices
+
+
+def _resolve_device(device_name="default"):
+    if isinstance(device_name, torch.device):
+        return device_name
+
+    if device_name is None or device_name == "" or device_name == "default":
+        return model_management.get_torch_device()
+
+    device_name = str(device_name)
+    if device_name == "cpu":
+        return torch.device("cpu")
+
+    if device_name.startswith("cuda:"):
+        if not torch.cuda.is_available():
+            raise RuntimeError(f"[HY-Motion] CUDA device requested but CUDA is not available: {device_name}")
+        try:
+            device_index = int(device_name.split(":", 1)[1])
+        except (IndexError, ValueError):
+            raise ValueError(f"[HY-Motion] Invalid CUDA device format: {device_name}. Use cuda:N.")
+        device_count = torch.cuda.device_count()
+        if device_index < 0 or device_index >= device_count:
+            raise ValueError(
+                f"[HY-Motion] Requested {device_name}, but only {device_count} CUDA device(s) are visible. "
+                "Check CUDA_VISIBLE_DEVICES or ComfyUI --cuda-device settings."
+            )
+        return torch.device(device_name)
+
+    raise ValueError(
+        f"[HY-Motion] Unsupported device '{device_name}'. "
+        f"Available choices: {', '.join(_get_device_choices())}"
+    )
+
+
+def _cuda_device_index(device):
+    if device.type != "cuda":
+        return None
+    if device.index is not None:
+        return device.index
+    return torch.cuda.current_device()
+
+
+def _get_module_device(module, fallback=None):
+    try:
+        for param in module.parameters():
+            if param.device.type != "meta":
+                return param.device
+    except Exception:
+        pass
+    return fallback
+
 
 class HYMotionLLMWrapper:
     """LLM model wrapper"""
-    def __init__(self, model, tokenizer, llm_type="qwen3", max_length=512, crop_start=0):
+    def __init__(self, model, tokenizer, llm_type="qwen3", max_length=512, crop_start=0, device=None):
         self.model = model
         self.tokenizer = tokenizer
         self.llm_type = llm_type
         self.max_length = max_length
         self.crop_start = crop_start
+        self.device = device
         self.hidden_size = model.config.hidden_size if hasattr(model, 'config') else 4096
 
 
 class HYMotionNetworkWrapper:
     """Diffusion Network wrapper"""
-    def __init__(self, network, config, mean, std, body_model=None):
+    def __init__(self, network, config, mean, std, body_model=None, device=None):
         self.network = network
         self.config = config
         self.mean = mean
         self.std = std
         self.body_model = body_model
+        self.device = device
 
 
 class HYMotionConditioning:
@@ -294,6 +357,7 @@ class HYMotionLoadLLM:
                 "model_name": (qwen_models, {"default": qwen_models[0]}),
                 "quantization": (["none", "int8", "int4", "bnb-4bit", "awq"], {"default": "none"}),
                 "offload_to_cpu": ("BOOLEAN", {"default": False}),
+                "device": (_get_device_choices(), {"default": "default"}),
             },
         }
 
@@ -302,7 +366,7 @@ class HYMotionLoadLLM:
     FUNCTION = "load_llm"
     CATEGORY = "HY-Motion/Loaders"
 
-    def load_llm(self, model_name="Qwen3-8B", quantization="none", offload_to_cpu=False):
+    def load_llm(self, model_name="Qwen3-8B", quantization="none", offload_to_cpu=False, device="default"):
         from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
         from .hymotion.network.text_encoders.model_constants import PROMPT_TEMPLATE_ENCODE_HUMAN_MOTION
 
@@ -321,16 +385,32 @@ class HYMotionLoadLLM:
                     f"Please download {model_name} and place it in either location."
                 )
 
-        print(f"[HY-Motion] Loading LLM: {local_path}, quantization={quantization}, offload_to_cpu={offload_to_cpu}")
+        requested_device = device
+        resolved_device = torch.device("cpu") if offload_to_cpu else _resolve_device(requested_device)
+        explicit_device = requested_device not in (None, "", "default")
+        print(
+            f"[HY-Motion] Loading LLM: {local_path}, model_name={model_name}, "
+            f"quantization={quantization}, offload_to_cpu={offload_to_cpu}, "
+            f"requested_device={requested_device}, resolved_device={resolved_device}"
+        )
 
         load_kwargs = {"low_cpu_mem_usage": True, "local_files_only": True}
+
+        def _apply_explicit_device_map():
+            if resolved_device.type == "cuda":
+                load_kwargs["device_map"] = {"": str(resolved_device)}
+            elif resolved_device.type == "cpu":
+                load_kwargs["device_map"] = "cpu"
 
         if offload_to_cpu:
             load_kwargs["device_map"] = "cpu"
             load_kwargs["torch_dtype"] = torch.float32
         elif quantization == "int8":
             load_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
-            load_kwargs["device_map"] = "auto"
+            if explicit_device:
+                _apply_explicit_device_map()
+            else:
+                load_kwargs["device_map"] = "auto"
         elif quantization == "int4":
             load_kwargs["quantization_config"] = BitsAndBytesConfig(
                 load_in_4bit=True,
@@ -338,7 +418,10 @@ class HYMotionLoadLLM:
                 bnb_4bit_use_double_quant=True,
                 bnb_4bit_quant_type="nf4",
             )
-            load_kwargs["device_map"] = "auto"
+            if explicit_device:
+                _apply_explicit_device_map()
+            else:
+                load_kwargs["device_map"] = "auto"
         elif quantization == "bnb-4bit":
             # For bnb-4bit models
             load_kwargs["quantization_config"] = BitsAndBytesConfig(
@@ -347,7 +430,10 @@ class HYMotionLoadLLM:
                 bnb_4bit_use_double_quant=True,
                 bnb_4bit_quant_type="nf4",
             )
-            load_kwargs["device_map"] = "auto"
+            if explicit_device:
+                _apply_explicit_device_map()
+            else:
+                load_kwargs["device_map"] = "auto"
         elif quantization == "awq":
             # For AWQ models
             try:
@@ -364,16 +450,22 @@ class HYMotionLoadLLM:
                 ]
                 crop_start = self._compute_crop_start(tokenizer, template)
 
-                if not offload_to_cpu and quantization == "none":
-                    device = model_management.get_torch_device()
-                    model = model.to(device)
+                if explicit_device and "device_map" not in load_kwargs:
+                    try:
+                        model = model.to(resolved_device)
+                    except Exception as e:
+                        print(f"[HY-Motion] AWQ move to {resolved_device} failed, keeping loaded device: {e}")
 
-                wrapper = HYMotionLLMWrapper(model=model, tokenizer=tokenizer, max_length=512, crop_start=crop_start)
-                print(f"[HY-Motion] LLM loaded, hidden_size={wrapper.hidden_size}")
+                actual_device = _get_module_device(model, resolved_device)
+                wrapper = HYMotionLLMWrapper(model=model, tokenizer=tokenizer, max_length=512, crop_start=crop_start, device=actual_device)
+                print(f"[HY-Motion] LLM loaded, hidden_size={wrapper.hidden_size}, device={actual_device}")
                 return (wrapper,)
             except ImportError:
                 print("[HY-Motion] AWQ not installed, falling back to regular loading")
-                load_kwargs["device_map"] = "auto"
+                if explicit_device:
+                    _apply_explicit_device_map()
+                else:
+                    load_kwargs["device_map"] = "auto"
 
         tokenizer = AutoTokenizer.from_pretrained(local_path, padding_side="right", local_files_only=True)
         model = AutoModelForCausalLM.from_pretrained(local_path, **load_kwargs)
@@ -386,12 +478,12 @@ class HYMotionLoadLLM:
         ]
         crop_start = self._compute_crop_start(tokenizer, template)
 
-        if not offload_to_cpu and quantization == "none":
-            device = model_management.get_torch_device()
-            model = model.to(device)
+        if quantization == "none" and "device_map" not in load_kwargs:
+            model = model.to(resolved_device)
 
-        wrapper = HYMotionLLMWrapper(model=model, tokenizer=tokenizer, max_length=512, crop_start=crop_start)
-        print(f"[HY-Motion] LLM loaded, hidden_size={wrapper.hidden_size}")
+        actual_device = _get_module_device(model, resolved_device)
+        wrapper = HYMotionLLMWrapper(model=model, tokenizer=tokenizer, max_length=512, crop_start=crop_start, device=actual_device)
+        print(f"[HY-Motion] LLM loaded, hidden_size={wrapper.hidden_size}, device={actual_device}")
         return (wrapper,)
 
     def _compute_crop_start(self, tokenizer, template) -> int:
@@ -431,6 +523,7 @@ class HYMotionLoadLLMGGUF:
             "required": {
                 "gguf_file": (gguf_files, {"default": "(select file)"}),
                 "device_strategy": (["gpu", "cpu", "balanced"], {"default": "gpu"}),
+                "device": (_get_device_choices(), {"default": "default"}),
             },
         }
 
@@ -439,7 +532,7 @@ class HYMotionLoadLLMGGUF:
     FUNCTION = "load_llm_gguf"
     CATEGORY = "HY-Motion/Loaders"
 
-    def load_llm_gguf(self, gguf_file, device_strategy="gpu"):
+    def load_llm_gguf(self, gguf_file, device_strategy="gpu", device="default"):
         # 首先进行紧急内存清理
         print("[HY-Motion] Emergency memory cleanup before loading...")
         import gc
@@ -491,7 +584,12 @@ class HYMotionLoadLLMGGUF:
         gguf_dir = os.path.dirname(gguf_path)
         gguf_filename = os.path.basename(gguf_path)
 
-        print(f"[HY-Motion] Loading LLM from GGUF: {gguf_path}, device_strategy={device_strategy}")
+        requested_device = device
+        resolved_device = torch.device("cpu") if device_strategy == "cpu" else _resolve_device(requested_device)
+        print(
+            f"[HY-Motion] Loading LLM from GGUF: {gguf_path}, device_strategy={device_strategy}, "
+            f"requested_device={requested_device}, resolved_device={resolved_device}"
+        )
         tokenizer = None
         tokenizer_loaded = False
         
@@ -594,7 +692,7 @@ class HYMotionLoadLLMGGUF:
                 "resume_download": False
             }
             
-            device = model_management.get_torch_device()
+            device = resolved_device
             
             # -------------------------- 执行前内存清理 --------------------------
             # 加载前先深度清理内存，防止内存碎片化
@@ -649,7 +747,7 @@ class HYMotionLoadLLMGGUF:
             elif device_strategy == "balanced":
                 # 平衡模式：合理使用GPU内存
                 if device.type == "cuda":
-                    device_index = device.index if device.index is not None else 0
+                    device_index = _cuda_device_index(device)
                     load_kwargs["device_map"] = device_index
                     
                     if torch.cuda.is_available():
@@ -670,7 +768,7 @@ class HYMotionLoadLLMGGUF:
             else:  # device_strategy == "gpu"
                 # GPU模式：优先使用GPU，积极使用GPU内存
                 if device.type == "cuda":
-                    device_index = device.index if device.index is not None else 0
+                    device_index = _cuda_device_index(device)
                     # 强制使用特定GPU设备
                     load_kwargs["device_map"] = device_index
                     
@@ -816,8 +914,9 @@ class HYMotionLoadLLMGGUF:
                 gc.collect()
                 
                 # 尝试使用优化的GPU模式
-                if device_strategy == "gpu" and torch.cuda.is_available():
+                if device_strategy == "gpu" and torch.cuda.is_available() and device.type == "cuda":
                     print("[HY-Motion] Attempting optimized GPU loading...")
+                    device_index = _cuda_device_index(device)
                     # 获取系统内存信息
                     try:
                         import psutil
@@ -827,7 +926,7 @@ class HYMotionLoadLLMGGUF:
                         # 计算合理的内存限制
                         # 强制使用更多GPU内存，减少CPU内存使用
                         cpu_memory_limit = min(int(total_system_memory * 0.2 / (1024**3)), 8)  # 最多使用8GB CPU内存
-                        gpu_memory_limit = int(torch.cuda.get_device_properties(device.index).total_memory * 0.9 / (1024**3))  # 使用90% GPU内存
+                        gpu_memory_limit = int(torch.cuda.get_device_properties(device_index).total_memory * 0.9 / (1024**3))  # 使用90% GPU内存
                         
                         print(f"[HY-Motion] System memory: {total_system_memory / (1024**3):.1f}GB total, {available_system_memory / (1024**3):.1f}GB available")
                         print(f"[HY-Motion] Setting memory limits: GPU={gpu_memory_limit}GiB, CPU={cpu_memory_limit}GiB")
@@ -835,7 +934,7 @@ class HYMotionLoadLLMGGUF:
                         # psutil不可用，使用默认值
                         print("[HY-Motion] psutil not available, using default memory limits")
                         cpu_memory_limit = 6  # 默认使用6GB CPU内存
-                        gpu_memory_limit = int(torch.cuda.get_device_properties(device.index).total_memory * 0.9 / (1024**3))  # 使用90% GPU内存
+                        gpu_memory_limit = int(torch.cuda.get_device_properties(device_index).total_memory * 0.9 / (1024**3))  # 使用90% GPU内存
                         print(f"[HY-Motion] Setting default memory limits: GPU={gpu_memory_limit}GiB, CPU={cpu_memory_limit}GiB")
                     
                     # 强制GPU模式：使用更积极的设备映射策略
@@ -844,13 +943,13 @@ class HYMotionLoadLLMGGUF:
                         "low_cpu_mem_usage": True,
                         "dtype": torch.float16,
                         "local_files_only": True,
-                        "device_map": device.index,  # 强制使用特定GPU设备
+                        "device_map": device_index,  # 强制使用特定GPU设备
                         "quantization_config": None,
                         "trust_remote_code": False,
                         "use_safetensors": False,
                         "attn_implementation": "eager",
                         "max_memory": {
-                            device.index: f"{gpu_memory_limit}GiB",
+                            device_index: f"{gpu_memory_limit}GiB",
                             "cpu": f"{cpu_memory_limit}GiB"  # 严格限制CPU内存使用
                         },
                         "use_cache": False,
@@ -1003,12 +1102,14 @@ class HYMotionLoadLLMGGUF:
         ]
         crop_start = self._compute_crop_start(tokenizer, template)
 
+        actual_device = _get_module_device(model, resolved_device)
         wrapper = HYMotionLLMWrapper(
             model=model,
             tokenizer=tokenizer,
             llm_type="qwen3_gguf",
             max_length=512,
-            crop_start=crop_start
+            crop_start=crop_start,
+            device=actual_device
         )
         
         # 再次清理内存
@@ -1016,7 +1117,7 @@ class HYMotionLoadLLMGGUF:
         if torch.cuda.is_available():
             torch.cuda.ipc_collect()
             
-        print(f"[HY-Motion] GGUF LLM loaded, hidden_size={wrapper.hidden_size}")
+        print(f"[HY-Motion] GGUF LLM loaded, hidden_size={wrapper.hidden_size}, device={actual_device}")
         return (wrapper,)
 
     def _compute_crop_start(self, tokenizer, template) -> int:
@@ -1054,6 +1155,7 @@ class HYMotionLoadNetwork:
         return {
             "required": {
                 "model_name": (model_names, {"default": default}),
+                "device": (_get_device_choices(), {"default": "default"}),
             },
         }
 
@@ -1062,7 +1164,7 @@ class HYMotionLoadNetwork:
     FUNCTION = "load_network"
     CATEGORY = "HY-Motion/Loaders"
 
-    def load_network(self, model_name):
+    def load_network(self, model_name, device="default"):
         from .hymotion.utils.loaders import load_object
         from .hymotion.pipeline.body_model import WoodenMesh
 
@@ -1075,7 +1177,9 @@ class HYMotionLoadNetwork:
                 f"  2. ComfyUI checkpoints folder as {model_name}.ckpt"
             )
 
-        print(f"[HY-Motion] Loading network: {model_name}")
+        requested_device = device
+        resolved_device = _resolve_device(requested_device)
+        print(f"[HY-Motion] Loading network: {model_name}, requested_device={requested_device}, resolved_device={resolved_device}")
 
         network = load_object(config["network_module"], config["network_module_args"])
         network.eval()
@@ -1110,12 +1214,12 @@ class HYMotionLoadNetwork:
                 mean = torch.from_numpy(np.load(mean_path)).float()
                 std = torch.from_numpy(np.load(std_path)).float()
 
-        device = model_management.get_torch_device()
+        device = resolved_device
         network = network.to(device)
         mean = mean.to(device)
         std = std.to(device)
 
-        wrapper = HYMotionNetworkWrapper(network=network, config=config, mean=mean, std=std, body_model=WoodenMesh())
+        wrapper = HYMotionNetworkWrapper(network=network, config=config, mean=mean, std=std, body_model=WoodenMesh(), device=device)
         wrapper.train_frames = 360
         wrapper.output_mesh_fps = 30
         wrapper.validation_steps = 50
@@ -1123,7 +1227,7 @@ class HYMotionLoadNetwork:
         wrapper.null_vtxt_feat = null_vtxt_feat.to(device)
         wrapper.null_ctxt_input = null_ctxt_input.to(device)
 
-        print("[HY-Motion] Network loaded")
+        print(f"[HY-Motion] Network loaded, device={device}")
         return (wrapper,)
 
 
@@ -1218,6 +1322,7 @@ class HYMotionEncodeText:
             "required": {
                 "llm": ("HYMOTION_LLM",),
                 "text": ("STRING", {"default": "A person is walking forward.", "multiline": True}),
+                "device": (_get_device_choices(), {"default": "default"}),
             },
         }
 
@@ -1226,8 +1331,9 @@ class HYMotionEncodeText:
     FUNCTION = "encode"
     CATEGORY = "HY-Motion/Conditioning"
 
-    def _ensure_clip_loaded(self):
+    def _ensure_clip_loaded(self, device="default"):
         """Lazy load CLIP model"""
+        target_device = _resolve_device(device)
         if HYMotionEncodeText._clip_model is None:
             from transformers import CLIPTextModel, CLIPTokenizer
             print("[HY-Motion] Loading CLIP (clip-vit-large-patch14)")
@@ -1253,21 +1359,27 @@ class HYMotionEncodeText:
             HYMotionEncodeText._clip_model = CLIPTextModel.from_pretrained(local_path, local_files_only=True)
             HYMotionEncodeText._clip_model = HYMotionEncodeText._clip_model.eval().requires_grad_(False)
 
-            device = model_management.get_torch_device()
-            HYMotionEncodeText._clip_model = HYMotionEncodeText._clip_model.to(device)
             print("[HY-Motion] CLIP loaded")
 
-    def encode(self, llm: HYMotionLLMWrapper, text: str):
+        clip_device = _get_module_device(HYMotionEncodeText._clip_model, target_device)
+        if clip_device != target_device:
+            print(f"[HY-Motion] Moving CLIP from {clip_device} to {target_device}")
+            HYMotionEncodeText._clip_model = HYMotionEncodeText._clip_model.to(target_device)
+            clip_device = _get_module_device(HYMotionEncodeText._clip_model, target_device)
+        return clip_device
+
+    def encode(self, llm: HYMotionLLMWrapper, text: str, device="default"):
         from .hymotion.network.text_encoders.model_constants import PROMPT_TEMPLATE_ENCODE_HUMAN_MOTION
 
-        self._ensure_clip_loaded()
+        requested_device = device
+        clip_device = self._ensure_clip_loaded(requested_device)
 
         text_list = [text]
-        device = model_management.get_torch_device()
+        device = clip_device
 
         # CLIP encoding - 优化内存使用
         enc = HYMotionEncodeText._clip_tokenizer(text_list, truncation=True, max_length=77, padding=True, return_tensors="pt")
-        clip_device = next(HYMotionEncodeText._clip_model.parameters()).device
+        clip_device = _get_module_device(HYMotionEncodeText._clip_model, device)
         
         # 清理CLIP编码前的内存
         torch.cuda.empty_cache()
@@ -1290,7 +1402,7 @@ class HYMotionEncodeText:
 
         max_length = llm.max_length + llm.crop_start
         llm_enc = llm.tokenizer(llm_text, truncation=True, max_length=max_length, padding="max_length", return_tensors="pt")
-        llm_device = next(llm.model.parameters()).device
+        llm_device = _get_module_device(llm.model, getattr(llm, "device", None) or device)
         
         # 清理LLM编码前的内存
         torch.cuda.empty_cache()
@@ -1324,7 +1436,7 @@ class HYMotionEncodeText:
             # 删除转换层以释放内存
             del conversion_layer
         
-        print(f"[HY-Motion] Encoded: vtxt={vtxt_raw.shape}, ctxt={ctxt_raw.shape}")
+        print(f"[HY-Motion] Encode Text requested_device={requested_device} clip_device={clip_device} llm_device={llm_device} vtxt={vtxt_raw.shape} ctxt={ctxt_raw.shape}")
         return (HYMotionConditioning(vtxt_raw, ctxt_raw, ctxt_length, text_list),)
 
 
@@ -1346,6 +1458,7 @@ class HYMotionGenerate:
             "optional": {
                 "cfg_scale": ("FLOAT", {"default": 5.0, "min": 1.0, "max": 15.0, "step": 0.5}),
                 "num_samples": ("INT", {"default": 1, "min": 1, "max": 4}),
+                "device": (_get_device_choices(), {"default": "default"}),
             }
         }
 
@@ -1355,18 +1468,34 @@ class HYMotionGenerate:
     CATEGORY = "HY-Motion"
 
     def generate(self, network: HYMotionNetworkWrapper, conditioning: HYMotionConditioning,
-                 duration: float, seed: int, cfg_scale: float = 5.0, num_samples: int = 1):
+                 duration: float, seed: int, cfg_scale: float = 5.0, num_samples: int = 1, device="default"):
         import comfy.utils
         from torchdiffeq import odeint
         from .hymotion.pipeline.motion_diffusion import length_to_mask, randn_tensor
 
-        device = model_management.get_torch_device()
+        requested_device = device
+        network_device = getattr(network, "device", None)
+        if network_device is not None:
+            device = _resolve_device(network_device)
+        elif requested_device not in (None, "", "default"):
+            device = _resolve_device(requested_device)
+        else:
+            device = model_management.get_torch_device()
+        print(f"[HY-Motion] Generate device={device}, requested_device={requested_device}, network_device={network_device}")
+
         network.network = network.network.to(device)
+        network.mean = network.mean.to(device)
+        network.std = network.std.to(device)
+        network.device = device
+        if hasattr(network, "null_vtxt_feat"):
+            network.null_vtxt_feat = network.null_vtxt_feat.to(device)
+        if hasattr(network, "null_ctxt_input"):
+            network.null_ctxt_input = network.null_ctxt_input.to(device)
 
         length = min(max(int(duration * network.output_mesh_fps), 20), network.train_frames)
         seeds = [seed + i for i in range(num_samples)]
 
-        print(f"[HY-Motion] Generating: {duration}s, length={length}, seeds={seeds}")
+        print(f"[HY-Motion] Generating: {duration}s, length={length}, seeds={seeds}, device={device}")
 
         vtxt_input = conditioning.vtxt_raw.to(device)
         ctxt_input = conditioning.ctxt_raw.to(device)
@@ -1377,9 +1506,9 @@ class HYMotionGenerate:
             ctxt_input = ctxt_input.repeat(num_samples, 1, 1)
             ctxt_length = ctxt_length.repeat(num_samples)
 
-        ctxt_mask = length_to_mask(ctxt_length, ctxt_input.shape[1])
+        ctxt_mask = length_to_mask(ctxt_length, ctxt_input.shape[1]).to(device)
         x_length = torch.LongTensor([length] * num_samples).to(device)
-        x_mask = length_to_mask(x_length, network.train_frames)
+        x_mask = length_to_mask(x_length, network.train_frames).to(device)
 
         do_cfg = cfg_scale > 1.0
         if do_cfg:
@@ -1407,7 +1536,7 @@ class HYMotionGenerate:
         def fn(t, x):
             x_in = torch.cat([x] * 2, dim=0) if do_cfg else x
             pred = network.network(x=x_in, ctxt_input=ctxt_input, vtxt_input=vtxt_input,
-                                   timesteps=t.expand(x_in.shape[0]), x_mask_temporal=x_mask, ctxt_mask_temporal=ctxt_mask)
+                                   timesteps=t.to(device).expand(x_in.shape[0]), x_mask_temporal=x_mask, ctxt_mask_temporal=ctxt_mask)
             if do_cfg:
                 pred_u, pred_c = pred.chunk(2)
                 pred = pred_u + cfg_scale * (pred_c - pred_u)
@@ -1431,8 +1560,10 @@ class HYMotionGenerate:
         from .hymotion.utils.geometry import rot6d_to_rotation_matrix, rotation_matrix_to_rot6d, matrix_to_quaternion, quaternion_to_matrix, quaternion_fix_continuity
         from .hymotion.utils.motion_process import smooth_rotation
 
-        std = torch.where(net.std < 1e-3, torch.ones_like(net.std), net.std)
-        x = latent * std + net.mean
+        mean = net.mean.to(latent.device)
+        std_source = net.std.to(latent.device)
+        std = torch.where(std_source < 1e-3, torch.ones_like(std_source), std_source)
+        x = latent * std + mean
         B, L = x.shape[:2]
 
         transl = x[..., :3].clone()
