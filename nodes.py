@@ -285,6 +285,120 @@ def _get_module_device(module, fallback=None):
     return fallback
 
 
+def _format_gib(value):
+    return f"{value / (1024 ** 3):.1f}GiB"
+
+
+def _log_memory_status(label, device=None):
+    parts = []
+    try:
+        import psutil
+        mem = psutil.virtual_memory()
+        proc_mem = psutil.Process(os.getpid()).memory_full_info()
+        parts.append(f"system_total={_format_gib(mem.total)}")
+        parts.append(f"available_ram={_format_gib(mem.available)}")
+        parts.append(f"RSS={_format_gib(proc_mem.rss)}")
+        if hasattr(proc_mem, "uss"):
+            parts.append(f"USS={_format_gib(proc_mem.uss)}")
+        if hasattr(proc_mem, "pss"):
+            parts.append(f"PSS={_format_gib(proc_mem.pss)}")
+    except Exception as e:
+        parts.append(f"memory_info_unavailable={e}")
+
+    try:
+        if torch.cuda.is_available():
+            cuda_device = device if isinstance(device, torch.device) and device.type == "cuda" else torch.device(f"cuda:{torch.cuda.current_device()}")
+            parts.append(f"gpu_allocated={_format_gib(torch.cuda.memory_allocated(cuda_device))}")
+            parts.append(f"gpu_reserved={_format_gib(torch.cuda.memory_reserved(cuda_device))}")
+    except Exception as e:
+        parts.append(f"gpu_memory_unavailable={e}")
+
+    print(f"[HY-Motion] {label}: " + ", ".join(parts))
+
+
+def _aggressive_cpu_cleanup(reason=""):
+    import gc
+    gc.collect()
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        pass
+
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+    except Exception:
+        pass
+
+    if reason:
+        print(f"[HY-Motion] CPU cleanup completed: {reason}")
+
+
+def _summarize_module_devices(module):
+    param_counts = {}
+    buffer_counts = {}
+    try:
+        for param in module.parameters(recurse=True):
+            key = str(param.device)
+            param_counts[key] = param_counts.get(key, 0) + 1
+    except Exception as e:
+        param_counts[f"error:{e}"] = 1
+
+    try:
+        for buffer in module.buffers(recurse=True):
+            key = str(buffer.device)
+            buffer_counts[key] = buffer_counts.get(key, 0) + 1
+    except Exception as e:
+        buffer_counts[f"error:{e}"] = 1
+
+    return param_counts, buffer_counts
+
+
+def _device_map_has_cpu_or_disk(device_map):
+    if device_map is None:
+        return False
+    if isinstance(device_map, dict):
+        values = device_map.values()
+    else:
+        values = [device_map]
+    for value in values:
+        nested_values = value if isinstance(value, (list, tuple, set)) else [value]
+        for item in nested_values:
+            item_s = str(item).lower()
+            if item_s == "cpu" or item_s == "disk" or item_s.startswith("disk"):
+                return True
+    return False
+
+
+def _validate_llm_gpu_only(model, strict_gpu_only, label="LLM"):
+    hf_device_map = getattr(model, "hf_device_map", None)
+    print(f"[HY-Motion] {label} hf_device_map={hf_device_map}")
+    param_counts, buffer_counts = _summarize_module_devices(model)
+    print(f"[HY-Motion] {label} parameter devices: {param_counts}")
+    print(f"[HY-Motion] {label} buffer devices: {buffer_counts}")
+
+    if not strict_gpu_only:
+        return
+
+    if _device_map_has_cpu_or_disk(hf_device_map):
+        raise RuntimeError(
+            f"[HY-Motion] strict_gpu_only=True but model has CPU/disk offload in hf_device_map: {hf_device_map}"
+        )
+
+    bad_params = {device: count for device, count in param_counts.items() if not device.startswith("cuda:")}
+    bad_buffers = {device: count for device, count in buffer_counts.items() if not device.startswith("cuda:")}
+    if bad_params or bad_buffers:
+        raise RuntimeError(
+            f"[HY-Motion] strict_gpu_only=True but model has non-CUDA params/buffers: "
+            f"params={bad_params}, buffers={bad_buffers}"
+        )
+
+    print("[HY-Motion] strict_gpu_only=True; CPU params/buffers/offload not detected")
+
+
 class HYMotionLLMWrapper:
     """LLM model wrapper"""
     def __init__(self, model, tokenizer, llm_type="qwen3", max_length=512, crop_start=0, device=None):
@@ -358,6 +472,10 @@ class HYMotionLoadLLM:
                 "quantization": (["none", "int8", "int4", "bnb-4bit", "awq"], {"default": "none"}),
                 "offload_to_cpu": ("BOOLEAN", {"default": False}),
                 "device": (_get_device_choices(), {"default": "default"}),
+                "strict_gpu_only": ("BOOLEAN", {"default": True}),
+                "fallback_to_cpu": ("BOOLEAN", {"default": False}),
+                "allow_cpu_offload": ("BOOLEAN", {"default": False}),
+                "allow_transformers_gguf_dequantization": ("BOOLEAN", {"default": False}),
             },
         }
 
@@ -366,7 +484,7 @@ class HYMotionLoadLLM:
     FUNCTION = "load_llm"
     CATEGORY = "HY-Motion/Loaders"
 
-    def load_llm(self, model_name="Qwen3-8B", quantization="none", offload_to_cpu=False, device="default"):
+    def load_llm(self, model_name="Qwen3-8B", quantization="none", offload_to_cpu=False, device="default", strict_gpu_only=True, fallback_to_cpu=False, allow_cpu_offload=False, allow_transformers_gguf_dequantization=False):
         from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
         from .hymotion.network.text_encoders.model_constants import PROMPT_TEMPLATE_ENCODE_HUMAN_MOTION
 
@@ -385,14 +503,28 @@ class HYMotionLoadLLM:
                     f"Please download {model_name} and place it in either location."
                 )
 
+        if strict_gpu_only and offload_to_cpu:
+            raise RuntimeError("[HY-Motion] strict_gpu_only=True forbids offload_to_cpu=True")
+        if strict_gpu_only and fallback_to_cpu:
+            raise RuntimeError("[HY-Motion] strict_gpu_only=True forbids fallback_to_cpu=True")
+        if strict_gpu_only and allow_cpu_offload:
+            raise RuntimeError("[HY-Motion] strict_gpu_only=True forbids allow_cpu_offload=True")
+        if offload_to_cpu and not allow_cpu_offload:
+            raise RuntimeError("[HY-Motion] offload_to_cpu=True requires allow_cpu_offload=True")
+
         requested_device = device
         resolved_device = torch.device("cpu") if offload_to_cpu else _resolve_device(requested_device)
+        if strict_gpu_only and resolved_device.type != "cuda":
+            raise RuntimeError(f"[HY-Motion] strict_gpu_only=True requires a CUDA device, got {resolved_device}")
         explicit_device = requested_device not in (None, "", "default")
         print(
             f"[HY-Motion] Loading LLM: {local_path}, model_name={model_name}, "
             f"quantization={quantization}, offload_to_cpu={offload_to_cpu}, "
-            f"requested_device={requested_device}, resolved_device={resolved_device}"
+            f"strict_gpu_only={strict_gpu_only}, fallback_to_cpu={fallback_to_cpu}, "
+            f"allow_cpu_offload={allow_cpu_offload}, requested_device={requested_device}, "
+            f"resolved_device={resolved_device}"
         )
+        _log_memory_status("Before LLM load", resolved_device)
 
         load_kwargs = {"low_cpu_mem_usage": True, "local_files_only": True}
 
@@ -407,7 +539,7 @@ class HYMotionLoadLLM:
             load_kwargs["torch_dtype"] = torch.float32
         elif quantization == "int8":
             load_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
-            if explicit_device:
+            if explicit_device or strict_gpu_only or not allow_cpu_offload:
                 _apply_explicit_device_map()
             else:
                 load_kwargs["device_map"] = "auto"
@@ -418,7 +550,7 @@ class HYMotionLoadLLM:
                 bnb_4bit_use_double_quant=True,
                 bnb_4bit_quant_type="nf4",
             )
-            if explicit_device:
+            if explicit_device or strict_gpu_only or not allow_cpu_offload:
                 _apply_explicit_device_map()
             else:
                 load_kwargs["device_map"] = "auto"
@@ -430,7 +562,7 @@ class HYMotionLoadLLM:
                 bnb_4bit_use_double_quant=True,
                 bnb_4bit_quant_type="nf4",
             )
-            if explicit_device:
+            if explicit_device or strict_gpu_only or not allow_cpu_offload:
                 _apply_explicit_device_map()
             else:
                 load_kwargs["device_map"] = "auto"
@@ -439,6 +571,8 @@ class HYMotionLoadLLM:
             try:
                 from awq import AutoAWQForCausalLM
                 print("[HY-Motion] Using AWQ for model loading")
+                if explicit_device or strict_gpu_only or not allow_cpu_offload:
+                    _apply_explicit_device_map()
                 tokenizer = AutoTokenizer.from_pretrained(local_path, padding_side="right", local_files_only=True)
                 model = AutoAWQForCausalLM.from_pretrained(local_path, **load_kwargs)
                 model = model.eval().requires_grad_(False)
@@ -457,12 +591,15 @@ class HYMotionLoadLLM:
                         print(f"[HY-Motion] AWQ move to {resolved_device} failed, keeping loaded device: {e}")
 
                 actual_device = _get_module_device(model, resolved_device)
+                _aggressive_cpu_cleanup("after LLM GPU load")
+                _log_memory_status("After LLM load", actual_device)
+                _validate_llm_gpu_only(model, strict_gpu_only, "LLM")
                 wrapper = HYMotionLLMWrapper(model=model, tokenizer=tokenizer, max_length=512, crop_start=crop_start, device=actual_device)
                 print(f"[HY-Motion] LLM loaded, hidden_size={wrapper.hidden_size}, device={actual_device}")
                 return (wrapper,)
             except ImportError:
                 print("[HY-Motion] AWQ not installed, falling back to regular loading")
-                if explicit_device:
+                if explicit_device or strict_gpu_only or not allow_cpu_offload:
                     _apply_explicit_device_map()
                 else:
                     load_kwargs["device_map"] = "auto"
@@ -482,6 +619,9 @@ class HYMotionLoadLLM:
             model = model.to(resolved_device)
 
         actual_device = _get_module_device(model, resolved_device)
+        _aggressive_cpu_cleanup("after LLM GPU load")
+        _log_memory_status("After LLM load", actual_device)
+        _validate_llm_gpu_only(model, strict_gpu_only, "LLM")
         wrapper = HYMotionLLMWrapper(model=model, tokenizer=tokenizer, max_length=512, crop_start=crop_start, device=actual_device)
         print(f"[HY-Motion] LLM loaded, hidden_size={wrapper.hidden_size}, device={actual_device}")
         return (wrapper,)
@@ -524,6 +664,10 @@ class HYMotionLoadLLMGGUF:
                 "gguf_file": (gguf_files, {"default": "(select file)"}),
                 "device_strategy": (["gpu", "cpu", "balanced"], {"default": "gpu"}),
                 "device": (_get_device_choices(), {"default": "default"}),
+                "strict_gpu_only": ("BOOLEAN", {"default": True}),
+                "fallback_to_cpu": ("BOOLEAN", {"default": False}),
+                "allow_cpu_offload": ("BOOLEAN", {"default": False}),
+                "allow_transformers_gguf_dequantization": ("BOOLEAN", {"default": False}),
             },
         }
 
@@ -532,7 +676,7 @@ class HYMotionLoadLLMGGUF:
     FUNCTION = "load_llm_gguf"
     CATEGORY = "HY-Motion/Loaders"
 
-    def load_llm_gguf(self, gguf_file, device_strategy="gpu", device="default"):
+    def load_llm_gguf(self, gguf_file, device_strategy="gpu", device="default", strict_gpu_only=True, fallback_to_cpu=False, allow_cpu_offload=False, allow_transformers_gguf_dequantization=False):
         # 首先进行紧急内存清理
         print("[HY-Motion] Emergency memory cleanup before loading...")
         import gc
@@ -584,12 +728,34 @@ class HYMotionLoadLLMGGUF:
         gguf_dir = os.path.dirname(gguf_path)
         gguf_filename = os.path.basename(gguf_path)
 
+        if strict_gpu_only and device_strategy == "cpu":
+            raise RuntimeError("[HY-Motion] strict_gpu_only=True forbids GGUF device_strategy=cpu")
+        if strict_gpu_only and fallback_to_cpu:
+            raise RuntimeError("[HY-Motion] strict_gpu_only=True forbids fallback_to_cpu=True")
+        if strict_gpu_only and allow_cpu_offload:
+            raise RuntimeError("[HY-Motion] strict_gpu_only=True forbids allow_cpu_offload=True")
+        if device_strategy == "balanced" and not allow_cpu_offload:
+            print("[HY-Motion] balanced requested but allow_cpu_offload=False; using fixed GPU placement")
+
         requested_device = device
         resolved_device = torch.device("cpu") if device_strategy == "cpu" else _resolve_device(requested_device)
+        if strict_gpu_only and resolved_device.type != "cuda":
+            raise RuntimeError(f"[HY-Motion] strict_gpu_only=True requires a CUDA device, got {resolved_device}")
         print(
             f"[HY-Motion] Loading LLM from GGUF: {gguf_path}, device_strategy={device_strategy}, "
+            f"strict_gpu_only={strict_gpu_only}, fallback_to_cpu={fallback_to_cpu}, "
+            f"allow_cpu_offload={allow_cpu_offload}, "
+            f"allow_transformers_gguf_dequantization={allow_transformers_gguf_dequantization}, "
             f"requested_device={requested_device}, resolved_device={resolved_device}"
         )
+        _log_memory_status("Before LLM load", resolved_device)
+
+        if device_strategy != "cpu" and not allow_transformers_gguf_dequantization:
+            print("[HY-Motion] For strict GPU loading without persistent CPU-expanded weights, prefer Qwen3-8B-AWQ or Qwen3-8B-bnb-4bit instead of Transformers GGUF loading.")
+            raise RuntimeError(
+                "[HY-Motion] allow_transformers_gguf_dequantization=False; refusing Transformers GGUF GPU load before dequantization. "
+                "Set allow_transformers_gguf_dequantization=True to allow the temporary CPU RAM spike, then strict validation will run after load."
+            )
         tokenizer = None
         tokenizer_loaded = False
         
@@ -740,55 +906,42 @@ class HYMotionLoadLLMGGUF:
             print("[HY-Motion] Memory cleanup completed")
             
             if device_strategy == "cpu":
-                # CPU模式：完全在CPU上加载，不使用GPU内存
                 load_kwargs["device_map"] = "cpu"
-                load_kwargs["dtype"] = torch.float16  # 使用dtype替代torch_dtype
-                print("[HY-Motion] CPU mode: Loading model entirely on CPU to save GPU memory")
-            elif device_strategy == "balanced":
-                # 平衡模式：合理使用GPU内存
+                load_kwargs["dtype"] = torch.float16
+                print("[HY-Motion] CPU mode: Loading model entirely on CPU")
+            elif device_strategy == "balanced" and allow_cpu_offload and not strict_gpu_only:
                 if device.type == "cuda":
                     device_index = _cuda_device_index(device)
                     load_kwargs["device_map"] = device_index
-                    
+
                     if torch.cuda.is_available():
                         gpu_memory = torch.cuda.get_device_properties(device_index).total_memory
-                        # 合理使用GPU内存（70%），为其他操作留适当空间
                         gpu_limit_gib = max(1, int((gpu_memory * 0.7) / (1024**3)))
-                        # 限制CPU内存使用
-                        cpu_limit_gib = 8  # 最多使用8GB CPU内存
+                        cpu_limit_gib = 8
                         load_kwargs["max_memory"] = {
-                            device_index: f"{gpu_limit_gib}GiB", 
-                            "cpu": f"{cpu_limit_gib}GiB"  # 限制CPU内存使用
+                            device_index: f"{gpu_limit_gib}GiB",
+                            "cpu": f"{cpu_limit_gib}GiB"
                         }
                         print(f"[HY-Motion] Balanced mode: using up to {gpu_limit_gib}GiB of GPU memory and {cpu_limit_gib}GiB of CPU memory")
-                        print("[HY-Motion] Using forced GPU device mapping for better memory management")
+                        print("[HY-Motion] CPU offload is allowed for this load")
                 else:
                     load_kwargs["device_map"] = "cpu"
-                    load_kwargs["dtype"] = torch.float16  # 使用dtype替代torch_dtype
-            else:  # device_strategy == "gpu"
-                # GPU模式：优先使用GPU，积极使用GPU内存
+                    load_kwargs["dtype"] = torch.float16
+            else:
                 if device.type == "cuda":
                     device_index = _cuda_device_index(device)
-                    # 强制使用特定GPU设备
-                    load_kwargs["device_map"] = device_index
-                    
+                    load_kwargs["device_map"] = {"": str(device)}
+
                     if torch.cuda.is_available():
                         gpu_memory = torch.cuda.get_device_properties(device_index).total_memory
-                        # 积极使用GPU内存（90%），充分利用GPU资源
                         gpu_limit_gib = max(1, int((gpu_memory * 0.9) / (1024**3)))
-                        # 严格限制CPU内存使用
-                        cpu_limit_gib = 6  # 最多使用6GB CPU内存
-                        load_kwargs["max_memory"] = {
-                            device_index: f"{gpu_limit_gib}GiB", 
-                            "cpu": f"{cpu_limit_gib}GiB"  # 严格限制CPU内存使用
-                        }
-                        print(f"[HY-Motion] GPU mode: using up to {gpu_limit_gib}GiB of GPU memory and {cpu_limit_gib}GiB of CPU memory")
-                        print("[HY-Motion] Forcing GPU device mapping to reduce CPU memory usage")
+                        load_kwargs["max_memory"] = {device_index: f"{gpu_limit_gib}GiB"}
+                        print(f"[HY-Motion] GPU mode: using up to {gpu_limit_gib}GiB of GPU memory; CPU max_memory omitted")
+                        print("[HY-Motion] Forcing fixed GPU device mapping")
                 else:
                     load_kwargs["device_map"] = "cpu"
-                    load_kwargs["dtype"] = torch.float16  # 使用dtype替代torch_dtype
+                    load_kwargs["dtype"] = torch.float16
             
-            # 添加额外的内存优化选项
             load_kwargs["use_cache"] = False  # 禁用模型缓存，减少内存使用
             
             # 移除不兼容的参数
@@ -844,6 +997,10 @@ class HYMotionLoadLLMGGUF:
                 if "out of memory" in str(e).lower() or "memory" in str(e).lower():
                     # 内存不足，尝试回退到CPU模式
                     print(f"[HY-Motion] GPU memory error: {e}")
+                    print(f"[HY-Motion] CUDA load failed on {device}")
+                    if not fallback_to_cpu:
+                        print("[HY-Motion] fallback_to_cpu=False; not falling back to CPU.")
+                        raise
                     print("[HY-Motion] Falling back to CPU mode...")
                     
                     # 深度清理内存
@@ -904,6 +1061,9 @@ class HYMotionLoadLLMGGUF:
             except np._core._exceptions._ArrayMemoryError as e:
                 # 捕获numpy内存分配错误
                 print(f"[HY-Motion] Numpy memory allocation error: {e}")
+                if not fallback_to_cpu:
+                    print("[HY-Motion] fallback_to_cpu=False; not falling back to CPU.")
+                    raise
                 print("[HY-Motion] Falling back to optimized GPU mode...")
                 
                 # 深度清理内存
@@ -1103,6 +1263,9 @@ class HYMotionLoadLLMGGUF:
         crop_start = self._compute_crop_start(tokenizer, template)
 
         actual_device = _get_module_device(model, resolved_device)
+        _aggressive_cpu_cleanup("after LLM GPU load")
+        _log_memory_status("After LLM load", actual_device)
+        _validate_llm_gpu_only(model, strict_gpu_only, "LLM")
         wrapper = HYMotionLLMWrapper(
             model=model,
             tokenizer=tokenizer,
