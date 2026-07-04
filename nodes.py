@@ -155,6 +155,129 @@ def _scan_gguf_files():
         return found
 
 
+_GGUF_QWEN35_ARCHITECTURES = {"qwen35", "qwen3_5"}
+
+
+def _resolve_gguf_path(gguf_file):
+    if gguf_file == "(select file)":
+        raise ValueError("Please select a GGUF file")
+
+    gguf_file = str(gguf_file)
+    if os.path.isabs(gguf_file) and os.path.exists(gguf_file):
+        return gguf_file
+
+    gguf_path = None
+    try:
+        gguf_path = folder_paths.get_full_path("hymotion_gguf", gguf_file)
+    except Exception:
+        pass
+
+    if gguf_path and os.path.exists(gguf_path):
+        return gguf_path
+
+    raise FileNotFoundError(
+        f"GGUF file not found: {gguf_file}\n"
+        f"Searched locations:\n"
+        f"  1. {os.path.join(HYMOTION_MODELS_DIR, 'ckpts', 'GGUF')}\n"
+        f"  2. {os.path.join(COMFY_MODELS_DIR, 'llm', 'GGUF')}\n"
+        f"  3. {os.path.join(COMFY_MODELS_DIR, 'LLM', 'GGUF')}"
+    )
+
+
+def _read_gguf_architecture(gguf_path):
+    """Return GGUF general.architecture when it can be read without extra deps."""
+    import struct
+
+    scalar_sizes = {
+        0: 1,
+        1: 1,
+        2: 2,
+        3: 2,
+        4: 4,
+        5: 4,
+        6: 4,
+        7: 1,
+        10: 8,
+        11: 8,
+        12: 8,
+    }
+
+    def _read_exact(f, size):
+        data = f.read(size)
+        if len(data) != size:
+            raise EOFError("Unexpected end of GGUF metadata")
+        return data
+
+    def _read_u32(f):
+        return struct.unpack("<I", _read_exact(f, 4))[0]
+
+    def _read_u64(f):
+        return struct.unpack("<Q", _read_exact(f, 8))[0]
+
+    def _read_string(f):
+        length = _read_u64(f)
+        if length > 16 * 1024 * 1024:
+            raise ValueError(f"Unreasonable GGUF string length: {length}")
+        return _read_exact(f, length).decode("utf-8", errors="replace")
+
+    def _skip_value(f, value_type):
+        if value_type in scalar_sizes:
+            f.seek(scalar_sizes[value_type], os.SEEK_CUR)
+            return
+        if value_type == 8:
+            length = _read_u64(f)
+            f.seek(length, os.SEEK_CUR)
+            return
+        if value_type == 9:
+            item_type = _read_u32(f)
+            count = _read_u64(f)
+            if item_type in scalar_sizes:
+                f.seek(scalar_sizes[item_type] * count, os.SEEK_CUR)
+                return
+            if item_type == 8:
+                for _ in range(count):
+                    length = _read_u64(f)
+                    f.seek(length, os.SEEK_CUR)
+                return
+            for _ in range(count):
+                _skip_value(f, item_type)
+            return
+        raise ValueError(f"Unsupported GGUF metadata value type: {value_type}")
+
+    try:
+        with open(gguf_path, "rb") as f:
+            if _read_exact(f, 4) != b"GGUF":
+                return None
+            _read_u32(f)
+            _read_u64(f)
+            metadata_kv_count = _read_u64(f)
+            for _ in range(metadata_kv_count):
+                key = _read_string(f)
+                value_type = _read_u32(f)
+                if key == "general.architecture":
+                    if value_type == 8:
+                        return _read_string(f)
+                    _skip_value(f, value_type)
+                    return None
+                _skip_value(f, value_type)
+    except Exception as e:
+        print(f"[HY-Motion] Could not read GGUF architecture metadata from {gguf_path}: {e}")
+    return None
+
+
+def _guard_transformers_gguf_architecture(gguf_path):
+    architecture = _read_gguf_architecture(gguf_path)
+    if architecture:
+        normalized = architecture.strip().lower().replace("-", "_").replace(".", "_")
+        if normalized in _GGUF_QWEN35_ARCHITECTURES:
+            raise ValueError(
+                f"Qwen3.5 GGUF detected (architecture={architecture}). "
+                "Transformers GGUF loader does not support qwen35/qwen3_5. "
+                "This is not a generation_config.json issue. Use the experimental llama.cpp backend "
+                "or use Qwen3-8B AWQ/bnb-4bit."
+            )
+    return architecture
+
 def _scan_hymotion_networks():
     """Scan for HY-Motion network models in multiple locations.
     Returns list of model names."""
@@ -705,29 +828,13 @@ class HYMotionLoadLLMGGUF:
         from .hymotion.network.text_encoders.model_constants import PROMPT_TEMPLATE_ENCODE_HUMAN_MOTION
         
         # -------------------------- Memory optimization --------------------------
-        # Determine the actual path
-        if gguf_file == "(select file)":
-            raise ValueError("Please select a GGUF file")
-
-        # Use folder_paths to resolve the file (handles all registered search paths)
-        gguf_path = None
-        try:
-            gguf_path = folder_paths.get_full_path("hymotion_gguf", gguf_file)
-        except Exception:
-            pass
-
-        if not gguf_path or not os.path.exists(gguf_path):
-            raise FileNotFoundError(
-                f"GGUF file not found: {gguf_file}\n"
-                f"Searched locations:\n"
-                f"  1. {os.path.join(HYMOTION_MODELS_DIR, 'ckpts', 'GGUF')}\n"
-                f"  2. {os.path.join(COMFY_MODELS_DIR, 'llm', 'GGUF')}\n"
-                f"  3. {os.path.join(COMFY_MODELS_DIR, 'LLM', 'GGUF')}"
-            )
+        gguf_path = _resolve_gguf_path(gguf_file)
+        gguf_architecture = _guard_transformers_gguf_architecture(gguf_path)
+        if gguf_architecture:
+            print(f"[HY-Motion] GGUF architecture={gguf_architecture}")
 
         gguf_dir = os.path.dirname(gguf_path)
         gguf_filename = os.path.basename(gguf_path)
-
         if strict_gpu_only and device_strategy == "cpu":
             raise RuntimeError("[HY-Motion] strict_gpu_only=True forbids GGUF device_strategy=cpu")
         if strict_gpu_only and fallback_to_cpu:
@@ -751,11 +858,9 @@ class HYMotionLoadLLMGGUF:
         _log_memory_status("Before LLM load", resolved_device)
 
         if device_strategy != "cpu" and not allow_transformers_gguf_dequantization:
+            print("[HY-Motion] allow_transformers_gguf_dequantization=False; proceeding with Transformers GGUF load because strict validation will run after load.")
+            print("[HY-Motion] Temporary CPU RAM growth during GGUF dequantization may still happen; persistent CPU params/buffers/offload will be rejected when strict_gpu_only=True.")
             print("[HY-Motion] For strict GPU loading without persistent CPU-expanded weights, prefer Qwen3-8B-AWQ or Qwen3-8B-bnb-4bit instead of Transformers GGUF loading.")
-            raise RuntimeError(
-                "[HY-Motion] allow_transformers_gguf_dequantization=False; refusing Transformers GGUF GPU load before dequantization. "
-                "Set allow_transformers_gguf_dequantization=True to allow the temporary CPU RAM spike, then strict validation will run after load."
-            )
         tokenizer = None
         tokenizer_loaded = False
         
@@ -1302,6 +1407,152 @@ class HYMotionLoadLLMGGUF:
         pos = _find_subseq(full_ids, marker_ids)
         return pos if pos >= 0 else max(0, len(full_ids) - 1)
 
+
+# ============================================================================
+# Node 1c: HYMotion LlamaCpp Embedding Test (Experimental)
+# ============================================================================
+
+class HYMotionLlamaCppEmbeddingTest:
+    """Experimentally test llama-cpp-python token-level GGUF embeddings."""
+
+    @classmethod
+    def INPUT_TYPES(s):
+        gguf_files = ["(select file)"] + _scan_gguf_files()
+        return {
+            "required": {
+                "gguf_file": (gguf_files, {"default": "(select file)"}),
+                "text": ("STRING", {"default": "A person is walking forward.", "multiline": True}),
+                "n_ctx": ("INT", {"default": 512, "min": 1, "max": 131072}),
+                "n_batch": ("INT", {"default": 512, "min": 1, "max": 131072}),
+                "n_gpu_layers": ("INT", {"default": -1, "min": -1, "max": 999}),
+                "main_gpu": ("INT", {"default": 1, "min": 0, "max": 31}),
+                "verbose": ("BOOLEAN", {"default": False}),
+                "pooling_type": (["none", "mean", "cls"], {"default": "none"}),
+            },
+            "optional": {
+                "backend_note": ("STRING", {"default": "llama-cpp-python direct in-process", "multiline": False}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("debug",)
+    FUNCTION = "test_embedding"
+    CATEGORY = "HY-Motion/Experimental"
+
+    def test_embedding(self, gguf_file, text="A person is walking forward.", n_ctx=512, n_batch=512,
+                       n_gpu_layers=-1, main_gpu=1, verbose=False, pooling_type="none", backend_note=""):
+        if pooling_type != "none":
+            raise RuntimeError(
+                "[HY-Motion] pooling_type must be 'none' for HY-Motion token-level conditioning. "
+                "Sequence embeddings from mean/cls pooling are insufficient."
+            )
+
+        try:
+            from llama_cpp import Llama
+            import llama_cpp.llama_cpp as llama_cpp_lib
+        except ImportError as e:
+            raise ImportError(
+                "[HY-Motion] llama-cpp-python is required for HY-Motion LlamaCpp Embedding Test. "
+                "Install it in the ComfyUI Python environment. For CUDA builds, you may need "
+                "CMAKE_ARGS=\"-DGGML_CUDA=on\" FORCE_CMAKE=1 pip install --upgrade "
+                "--force-reinstall --no-cache-dir llama-cpp-python"
+            ) from e
+
+        gguf_path = _resolve_gguf_path(gguf_file)
+        architecture = _read_gguf_architecture(gguf_path)
+        pooling_none = getattr(llama_cpp_lib, "LLAMA_POOLING_TYPE_NONE", 0)
+        has_embeddings_ith = hasattr(llama_cpp_lib, "llama_get_embeddings_ith")
+        llm = None
+
+        try:
+            print(
+                f"[HY-Motion] Loading llama.cpp embedding test model: {gguf_path}, "
+                f"architecture={architecture}, n_ctx={n_ctx}, n_batch={n_batch}, "
+                f"n_gpu_layers={n_gpu_layers}, main_gpu={main_gpu}, pooling_type=none"
+            )
+            llm = Llama(
+                model_path=gguf_path,
+                embedding=True,
+                pooling_type=pooling_none,
+                n_ctx=int(n_ctx),
+                n_batch=int(n_batch),
+                n_gpu_layers=int(n_gpu_layers),
+                main_gpu=int(main_gpu),
+                verbose=bool(verbose),
+            )
+
+            tokens = llm.tokenize(text.encode("utf-8"))
+            token_count = len(tokens)
+            if token_count <= 0:
+                raise RuntimeError("[HY-Motion] llama.cpp tokenizer returned no tokens")
+            if token_count > int(n_ctx):
+                raise RuntimeError(
+                    f"[HY-Motion] token_count={token_count} exceeds n_ctx={n_ctx}; increase n_ctx."
+                )
+            if token_count > int(n_batch):
+                raise RuntimeError(
+                    f"[HY-Motion] token_count={token_count} exceeds n_batch={n_batch}; increase n_batch."
+                )
+
+            embeddings, total_tokens = llm.embed(text, normalize=False, truncate=False, return_count=True)
+            embedding_array = np.asarray(embeddings, dtype=np.float32)
+            if embedding_array.ndim == 1:
+                raise RuntimeError(
+                    "[HY-Motion] llama.cpp returned a single sequence embedding vector, not token-level embeddings. "
+                    "HY-Motion requires shape [seq_len, hidden_size], so this result is insufficient."
+                )
+            if embedding_array.ndim != 2:
+                raise RuntimeError(
+                    f"[HY-Motion] Expected token-level embedding shape [seq_len, hidden_size], "
+                    f"got {embedding_array.shape}."
+                )
+            if token_count > 1 and embedding_array.shape[0] == 1:
+                raise RuntimeError(
+                    "[HY-Motion] llama.cpp returned only one embedding row for multiple tokens. "
+                    "This looks like sequence pooling and is insufficient for HY-Motion."
+                )
+
+            hidden_size = embedding_array.shape[-1]
+            try:
+                model_hidden_size = int(llm.n_embd())
+            except Exception:
+                model_hidden_size = hidden_size
+            first5 = embedding_array[0, :5].tolist()
+            last5 = embedding_array[-1, :5].tolist()
+            debug_lines = [
+                "[HY-Motion] llama.cpp token-level embedding test succeeded",
+                f"gguf_path: {gguf_path}",
+                f"architecture: {architecture}",
+                f"backend_note: {backend_note}",
+                f"api_used: Llama.embed(pooling_type=LLAMA_POOLING_TYPE_NONE); llama_get_embeddings_ith_available={has_embeddings_ith}",
+                f"token_count: {token_count}",
+                f"total_tokens_reported_by_llama_cpp: {total_tokens}",
+                f"embedding shape: {tuple(embedding_array.shape)}",
+                f"hidden_size: {hidden_size}",
+                f"model_hidden_size: {model_hidden_size}",
+                f"dtype: {embedding_array.dtype}",
+                f"first token embedding first5: {first5}",
+                f"last token embedding first5: {last5}",
+                "HY-Motion conditioning integration not attempted in this test node.",
+            ]
+            debug = "\n".join(debug_lines)
+            print(debug)
+            return (debug,)
+        finally:
+            if llm is not None:
+                try:
+                    if hasattr(llm, "close"):
+                        llm.close()
+                except Exception as e:
+                    print(f"[HY-Motion] llama.cpp close warning: {e}")
+                del llm
+            import gc
+            gc.collect()
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
 
 # ============================================================================
 # Node 2: HYMotion Load Network
@@ -2244,6 +2495,7 @@ class HYMotionPreviewAnimation:
 NODE_CLASS_MAPPINGS = {
     "HYMotionLoadLLM": HYMotionLoadLLM,
     "HYMotionLoadLLMGGUF": HYMotionLoadLLMGGUF,
+    "HYMotionLlamaCppEmbeddingTest": HYMotionLlamaCppEmbeddingTest,
     "HYMotionLoadNetwork": HYMotionLoadNetwork,
     "HYMotionLoadPrompter": HYMotionLoadPrompter,
     "HYMotionRewritePrompt": HYMotionRewritePrompt,
@@ -2258,6 +2510,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "HYMotionLoadLLM": "HY-Motion Load LLM",
     "HYMotionLoadLLMGGUF": "HY-Motion Load LLM (GGUF)",
+    "HYMotionLlamaCppEmbeddingTest": "HY-Motion LlamaCpp Embedding Test",
     "HYMotionLoadNetwork": "HY-Motion Load Network",
     "HYMotionLoadPrompter": "HY-Motion Load Prompter",
     "HYMotionRewritePrompt": "HY-Motion Rewrite Prompt",
