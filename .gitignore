@@ -32,3 +32,37 @@ __pycache__
 HY-Motion-1.0
 
 node.zip
+
+AGENTS.md
+
+# Local agent and Codex state
+.agents/
+.codex/
+.local/
+
+# Local backups and temporary files
+*.bak
+*.orig
+*.tmp
+
+# Model weights and quantized files
+*.ckpt
+*.safetensors
+*.gguf
+*.pt
+*.pth
+*.onnx
+*.bin
+*.engine
+*.tensorrt
+models/
+ckpts/
+
+# Generated ComfyUI / HY-Motion outputs
+output/
+outputs/
+temp/
+tmp/
+generated/
+ComfyUI/output/
+ComfyUI/temp/
