@@ -535,13 +535,50 @@ class HYMotionLLMWrapper:
 
 
 
+def _apply_hymotion_chat_template(tokenizer, messages):
+    try:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+            enable_thinking=False,
+        )
+    except TypeError:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+
+
+def _compute_hymotion_crop_start(tokenizer, system_prompt: str) -> int:
+    def _find_subseq(a, b):
+        for i in range(len(a) - len(b) + 1):
+            if a[i:i + len(b)] == b:
+                return i
+        return -1
+
+    marker = "<BOC>"
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": marker},
+    ]
+    prompt = _apply_hymotion_chat_template(tokenizer, messages)
+    full_ids = tokenizer(prompt, return_tensors="pt", add_special_tokens=True)["input_ids"][0].tolist()
+    marker_ids = tokenizer(marker, return_tensors="pt", add_special_tokens=False)["input_ids"][0].tolist()
+    pos = _find_subseq(full_ids, marker_ids)
+    return pos if pos >= 0 else max(0, len(full_ids) - 1)
+
+
 class HYMotionLlamaCppLLMWrapper:
     """llama.cpp LLM wrapper for experimental HY-Motion conditioning."""
     def __init__(self, llama, gguf_path, n_ctx, n_batch, n_gpu_layers, main_gpu,
-                 split_mode, split_mode_value, hidden_size, device=None):
+                 split_mode, split_mode_value, hidden_size, tokenizer_dir=None,
+                 tokenizer=None, crop_start=0, max_length=512, device=None):
         self.llama = llama
         self.model = llama
-        self.tokenizer = None
+        self.tokenizer_dir = tokenizer_dir
+        self.tokenizer = tokenizer
         self.gguf_path = gguf_path
         self.llm_type = "llama.cpp"
         self.backend_name = "llama.cpp"
@@ -553,6 +590,8 @@ class HYMotionLlamaCppLLMWrapper:
         self.split_mode = split_mode
         self.split_mode_value = split_mode_value
         self.hidden_size = int(hidden_size)
+        self.crop_start = int(crop_start)
+        self.max_length = int(max_length)
         self.device = device
 
     def release(self):
@@ -1471,7 +1510,7 @@ class HYMotionLlamaCppEmbeddingTest:
                 "gguf_file": (gguf_files, {"default": "(select file)"}),
                 "text": ("STRING", {"default": "A person is walking forward.", "multiline": True}),
                 "n_ctx": ("INT", {"default": 512, "min": 1, "max": 131072}),
-                "n_batch": ("INT", {"default": 512, "min": 1, "max": 131072}),
+                "n_batch": ("INT", {"default": 128, "min": 1, "max": 131072}),
                 "n_gpu_layers": ("INT", {"default": -1, "min": -1, "max": 999}),
                 "main_gpu": ("INT", {"default": 1, "min": 0, "max": 31}),
                 "split_mode": (["none", "layer", "row"], {"default": "none"}),
@@ -1630,11 +1669,14 @@ class HYMotionLoadLLMLlamaCppExperimental:
             "required": {
                 "gguf_file": (gguf_files, {"default": "(select file)"}),
                 "n_ctx": ("INT", {"default": 512, "min": 1, "max": 131072}),
-                "n_batch": ("INT", {"default": 512, "min": 1, "max": 131072}),
+                "n_batch": ("INT", {"default": 128, "min": 1, "max": 131072}),
                 "n_gpu_layers": ("INT", {"default": -1, "min": -1, "max": 999}),
                 "main_gpu": ("INT", {"default": 1, "min": 0, "max": 31}),
                 "split_mode": (["none", "layer", "row"], {"default": "none"}),
                 "verbose": ("BOOLEAN", {"default": False}),
+            },
+            "optional": {
+                "tokenizer_dir": ("STRING", {"default": os.path.join(HYMOTION_MODELS_DIR, "ckpts", "Qwen3-8B"), "multiline": False}),
             },
         }
 
@@ -1643,8 +1685,8 @@ class HYMotionLoadLLMLlamaCppExperimental:
     FUNCTION = "load_llm"
     CATEGORY = "HY-Motion/Loaders"
 
-    def load_llm(self, gguf_file, n_ctx=512, n_batch=512, n_gpu_layers=-1,
-                 main_gpu=1, split_mode="none", verbose=False):
+    def load_llm(self, gguf_file, n_ctx=512, n_batch=128, n_gpu_layers=-1,
+                 main_gpu=1, split_mode="none", verbose=False, tokenizer_dir=None):
         try:
             from llama_cpp import Llama
             import llama_cpp.llama_cpp as llama_cpp_lib
@@ -1655,9 +1697,34 @@ class HYMotionLoadLLMLlamaCppExperimental:
                 "CMAKE_ARGS=\"-DGGML_CUDA=on\" FORCE_CMAKE=1 pip install --upgrade "
                 "--force-reinstall --no-cache-dir llama-cpp-python"
             ) from e
+        from transformers import AutoTokenizer
+        from .hymotion.network.text_encoders.model_constants import PROMPT_TEMPLATE_ENCODE_HUMAN_MOTION
 
         gguf_path = _resolve_gguf_path(gguf_file)
         architecture = _read_gguf_architecture(gguf_path)
+        if tokenizer_dir in (None, "") or not str(tokenizer_dir).strip():
+            tokenizer_dir = os.path.join(HYMOTION_MODELS_DIR, "ckpts", "Qwen3-8B")
+        tokenizer_dir = os.path.abspath(os.path.expanduser(str(tokenizer_dir).strip()))
+        print(f"[HY-Motion] Loading llama.cpp HF tokenizer only: {tokenizer_dir}")
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_dir,
+                padding_side="right",
+                local_files_only=True,
+            )
+        except Exception as e:
+            raise FileNotFoundError(
+                f"[HY-Motion] Failed to load HF tokenizer for llama.cpp conditioning from tokenizer_dir={tokenizer_dir!r}. "
+                "Place a Qwen3-compatible tokenizer directory there, or set tokenizer_dir explicitly."
+            ) from e
+        crop_start = _compute_hymotion_crop_start(tokenizer, PROMPT_TEMPLATE_ENCODE_HUMAN_MOTION)
+        max_length = 512
+        required_ctx = crop_start + max_length
+        if int(n_ctx) < required_ctx:
+            print(
+                f"[HY-Motion] WARNING: n_ctx={n_ctx} is smaller than crop_start + max_length = {required_ctx}. "
+                "prompt_format=hymotion_template will raise during encoding unless n_ctx is increased."
+            )
         pooling_none = getattr(llama_cpp_lib, "LLAMA_POOLING_TYPE_NONE", 0)
         split_modes = {
             "none": getattr(llama_cpp_lib, "LLAMA_SPLIT_MODE_NONE", 0),
@@ -1701,11 +1768,16 @@ class HYMotionLoadLLMLlamaCppExperimental:
             split_mode=split_mode,
             split_mode_value=split_mode_value,
             hidden_size=hidden_size,
+            tokenizer_dir=tokenizer_dir,
+            tokenizer=tokenizer,
+            crop_start=crop_start,
+            max_length=max_length,
             device=f"llama.cpp main_gpu={main_gpu}",
         )
         print(
             f"[HY-Motion] llama.cpp LLM loaded, hidden_size={hidden_size}, "
-            f"backend_name={wrapper.backend_name}, main_gpu={main_gpu}, split_mode={split_mode}"
+            f"backend_name={wrapper.backend_name}, main_gpu={main_gpu}, split_mode={split_mode}, "
+            f"tokenizer_dir={tokenizer_dir}, crop_start={crop_start}, max_length={max_length}"
         )
         return (wrapper,)
 # ============================================================================
@@ -2048,7 +2120,8 @@ class HYMotionEncodeTextLlamaCppExperimental:
             },
             "optional": {
                 "device": (_get_device_choices(), {"default": "default"}),
-                "hidden_size_adapter": (["zero_pad_2560_to_4096", "strict_4096"], {"default": "zero_pad_2560_to_4096"}),
+                "prompt_format": (["hymotion_template", "direct"], {"default": "hymotion_template"}),
+                "hidden_size_adapter": (["strict_4096", "unsafe_zero_pad_2560_to_4096"], {"default": "strict_4096"}),
             },
         }
 
@@ -2057,16 +2130,21 @@ class HYMotionEncodeTextLlamaCppExperimental:
     FUNCTION = "encode"
     CATEGORY = "HY-Motion/Conditioning"
 
-    def encode(self, llm, text: str, device="default", hidden_size_adapter="zero_pad_2560_to_4096"):
+    def encode(self, llm, text: str, device="default", prompt_format="hymotion_template", hidden_size_adapter="strict_4096"):
+        from .hymotion.network.text_encoders.model_constants import PROMPT_TEMPLATE_ENCODE_HUMAN_MOTION
+
         backend_name = getattr(llm, "backend_name", None)
         if backend_name != "llama.cpp":
             raise RuntimeError(
                 f"[HY-Motion] HY-Motion Encode Text LlamaCpp Experimental requires backend_name='llama.cpp', "
                 f"got {backend_name!r}. Use HY-Motion Load LLM LlamaCpp Experimental."
             )
+        if prompt_format not in ("hymotion_template", "direct"):
+            raise RuntimeError(f"[HY-Motion] Unsupported prompt_format={prompt_format!r}")
 
         expected_dim = 4096
         supported_llama_dims = (2560, expected_dim)
+        unsafe_adapter_names = {"unsafe_zero_pad_2560_to_4096", "zero_pad_2560_to_4096"}
         hidden_size = int(getattr(llm, "hidden_size", 0) or 0)
         if hidden_size not in supported_llama_dims:
             raise RuntimeError(
@@ -2074,10 +2152,15 @@ class HYMotionEncodeTextLlamaCppExperimental:
                 f"supports hidden_size=2560 or {expected_dim}. Projection is not implemented; stopping because "
                 "an untrained projection cannot be quality-guaranteed."
             )
-        if hidden_size == 2560 and hidden_size_adapter != "zero_pad_2560_to_4096":
+        if hidden_size == 2560 and hidden_size_adapter not in unsafe_adapter_names:
             raise RuntimeError(
-                "[HY-Motion] llama.cpp hidden_size=2560 requires hidden_size_adapter=zero_pad_2560_to_4096. "
-                "strict_4096 accepts only native 4096-dim embeddings."
+                "[HY-Motion] llama.cpp hidden_size=2560 requires hidden_size_adapter="
+                "unsafe_zero_pad_2560_to_4096. strict_4096 accepts only native 4096-dim embeddings."
+            )
+        if hidden_size_adapter == "zero_pad_2560_to_4096":
+            print(
+                "[HY-Motion] WARNING: hidden_size_adapter=zero_pad_2560_to_4096 is a legacy alias; "
+                "use unsafe_zero_pad_2560_to_4096 to make the untrained padding explicit."
             )
 
         llama = getattr(llm, "llama", None)
@@ -2109,19 +2192,69 @@ class HYMotionEncodeTextLlamaCppExperimental:
         del enc, out
         torch.cuda.empty_cache()
 
-        tokenizer_count = len(llama.tokenize(text.encode("utf-8")))
-        if tokenizer_count <= 0:
-            raise RuntimeError("[HY-Motion] llama.cpp tokenizer returned no tokens")
-        if tokenizer_count > int(llm.n_ctx):
+        tokenizer = getattr(llm, "tokenizer", None)
+        crop_start = int(getattr(llm, "crop_start", 0) or 0)
+        max_length = int(getattr(llm, "max_length", 512) or 512)
+        if prompt_format == "hymotion_template":
+            if tokenizer is None:
+                raise RuntimeError(
+                    "[HY-Motion] prompt_format=hymotion_template requires the HF tokenizer loaded by "
+                    "HY-Motion Load LLM LlamaCpp Experimental. Reload the llama.cpp LLM node."
+                )
+            messages = [
+                {"role": "system", "content": PROMPT_TEMPLATE_ENCODE_HUMAN_MOTION},
+                {"role": "user", "content": text},
+            ]
+            actual_prompt_text = _apply_hymotion_chat_template(tokenizer, messages)
+            effective_crop_start = crop_start
+        else:
+            actual_prompt_text = text
+            effective_crop_start = 0
+
+        required_ctx = effective_crop_start + max_length
+        n_ctx = int(getattr(llm, "n_ctx", 0) or 0)
+        if n_ctx < required_ctx:
             raise RuntimeError(
-                f"[HY-Motion] token_count={tokenizer_count} exceeds llama.cpp n_ctx={llm.n_ctx}; reload with larger n_ctx."
-            )
-        if tokenizer_count > int(llm.n_batch):
-            raise RuntimeError(
-                f"[HY-Motion] token_count={tokenizer_count} exceeds llama.cpp n_batch={llm.n_batch}; reload with larger n_batch."
+                f"[HY-Motion] n_ctx={n_ctx} is too small for prompt_format={prompt_format}. "
+                f"Need at least crop_start + max_length = {required_ctx}. "
+                f"Increase n_ctx to {required_ctx} or higher."
             )
 
-        embeddings, total_tokens = llama.embed(text, normalize=False, truncate=False, return_count=True)
+        hf_token_ids = None
+        hf_token_count = None
+        if tokenizer is not None:
+            try:
+                hf_token_ids = tokenizer(actual_prompt_text, return_tensors="pt", add_special_tokens=True)["input_ids"][0].tolist()
+                hf_token_count = len(hf_token_ids)
+            except Exception as e:
+                print(f"[HY-Motion] WARNING: HF tokenizer debug tokenization failed: {e}")
+        try:
+            llama_token_ids = llama.tokenize(actual_prompt_text.encode("utf-8"))
+        except Exception as e:
+            raise RuntimeError(f"[HY-Motion] llama.cpp tokenizer failed for prompt_format={prompt_format}: {e}") from e
+        llama_token_count = len(llama_token_ids)
+        if llama_token_count <= 0:
+            raise RuntimeError("[HY-Motion] llama.cpp tokenizer returned no tokens")
+        if llama_token_count > n_ctx:
+            raise RuntimeError(
+                f"[HY-Motion] llama.cpp token_count={llama_token_count} exceeds n_ctx={n_ctx}; reload with larger n_ctx."
+            )
+        n_batch = int(getattr(llm, "n_batch", 0) or 0)
+        if n_batch > 0 and llama_token_count > n_batch:
+            print(
+                f"[HY-Motion] WARNING: llama.cpp token_count={llama_token_count} exceeds n_batch={n_batch}. "
+                "llama.cpp may process this in smaller batches or raise internally."
+            )
+        token_ids_match = (hf_token_ids == llama_token_ids) if hf_token_ids is not None else None
+        if token_ids_match is False:
+            print("[HY-Motion] WARNING: HF tokenizer token ids and llama.cpp token ids differ for this prompt.")
+
+        embed_result = llama.embed(actual_prompt_text, normalize=False, truncate=False, return_count=True)
+        if isinstance(embed_result, tuple) and len(embed_result) == 2:
+            embeddings, total_tokens = embed_result
+        else:
+            embeddings = embed_result
+            total_tokens = None
         embedding_array = np.asarray(embeddings, dtype=np.float32)
         if embedding_array.ndim == 1:
             raise RuntimeError(
@@ -2133,27 +2266,41 @@ class HYMotionEncodeTextLlamaCppExperimental:
                 f"[HY-Motion] Expected llama.cpp token-level embedding shape [seq_len, hidden_size], "
                 f"got {embedding_array.shape}."
             )
+        pre_crop_embedding_shape = tuple(embedding_array.shape)
         embedding_dim = int(embedding_array.shape[-1])
         if embedding_dim not in supported_llama_dims:
             raise RuntimeError(
                 f"[HY-Motion] llama.cpp embedding hidden_size={embedding_dim}, but this experimental node only "
                 f"supports hidden_size=2560 or {expected_dim}. Projection is not implemented; stopping."
             )
-        if embedding_dim == 2560 and hidden_size_adapter != "zero_pad_2560_to_4096":
+        if embedding_dim == 2560 and hidden_size_adapter not in unsafe_adapter_names:
             raise RuntimeError(
-                "[HY-Motion] llama.cpp returned hidden_size=2560, but hidden_size_adapter is strict_4096."
+                "[HY-Motion] llama.cpp returned hidden_size=2560, but hidden_size_adapter is strict_4096. "
+                "Select unsafe_zero_pad_2560_to_4096 only if you accept the untrained padding risk."
             )
 
-        token_count = int(embedding_array.shape[0])
-        if token_count <= 0:
+        embedding_rows = int(embedding_array.shape[0])
+        if embedding_rows <= 0:
             raise RuntimeError("[HY-Motion] llama.cpp returned no token-level embedding rows")
-        if tokenizer_count != token_count:
+        if total_tokens is None:
+            total_tokens = embedding_rows
+        total_tokens = int(total_tokens)
+        if llama_token_count != embedding_rows:
             print(
-                f"[HY-Motion] llama.cpp token count warning: tokenizer_count={tokenizer_count}, "
-                f"embedding_rows={token_count}; using embedding_rows for ctxt_length"
+                f"[HY-Motion] llama.cpp token count warning: tokenizer_count={llama_token_count}, "
+                f"embedding_rows={embedding_rows}; using total_tokens={total_tokens} for ctxt_length"
             )
 
-        ctxt_tensor = torch.from_numpy(embedding_array).to(device=device, dtype=torch.float32)
+        cropped = embedding_array[effective_crop_start:effective_crop_start + max_length]
+        ctxt_tensor = torch.from_numpy(cropped).to(device=device, dtype=torch.float32)
+        if ctxt_tensor.shape[0] < max_length:
+            pad = torch.zeros(
+                (max_length - ctxt_tensor.shape[0], ctxt_tensor.shape[-1]),
+                dtype=ctxt_tensor.dtype,
+                device=ctxt_tensor.device,
+            )
+            ctxt_tensor = torch.cat([ctxt_tensor, pad], dim=0)
+
         adapter_note = "native_4096"
         if embedding_dim == 2560:
             pad_dim = expected_dim - embedding_dim
@@ -2163,19 +2310,53 @@ class HYMotionEncodeTextLlamaCppExperimental:
                 device=ctxt_tensor.device,
             )
             ctxt_tensor = torch.cat([ctxt_tensor, pad], dim=-1)
-            adapter_note = f"zero_pad_2560_to_4096(pad_dim={pad_dim})"
+            adapter_note = f"unsafe_zero_pad_2560_to_4096(pad_dim={pad_dim})"
             print(
-                "[HY-Motion] WARNING: EXPERIMENTAL zero-padding llama.cpp embeddings "
+                "[HY-Motion] WARNING: UNSAFE EXPERIMENTAL zero-padding llama.cpp embeddings "
                 "from hidden_size=2560 to 4096. Output quality is not guaranteed."
             )
-        ctxt_raw = ctxt_tensor.unsqueeze(0)
-        ctxt_length = torch.tensor([token_count], dtype=torch.long, device=device)
-        print(
-            f"[HY-Motion] Encode Text LlamaCpp clip_device={clip_device} requested_device={requested_device} "
-            f"main_gpu={getattr(llm, 'main_gpu', None)} split_mode={getattr(llm, 'split_mode', None)} "
-            f"hidden_size_adapter={adapter_note} vtxt={vtxt_raw.shape} ctxt={ctxt_raw.shape} "
-            f"token_count={token_count} total_tokens={total_tokens}"
-        )
+
+        ctxt_raw = ctxt_tensor.unsqueeze(0).contiguous()
+        valid_len = min(max(total_tokens - effective_crop_start, 0), max_length)
+        ctxt_length = torch.tensor([valid_len], dtype=torch.long, device=device)
+
+        prompt_head = actual_prompt_text[:300].replace("\n", "\\n")
+        prompt_tail = actual_prompt_text[-300:].replace("\n", "\\n")
+        hf_head = hf_token_ids[:20] if hf_token_ids is not None else None
+        hf_tail = hf_token_ids[-20:] if hf_token_ids is not None else None
+        llama_head = llama_token_ids[:20]
+        llama_tail = llama_token_ids[-20:]
+        debug_lines = [
+            "[HY-Motion] Encode Text LlamaCpp debug",
+            f"raw_text: {text!r}",
+            f"prompt_format: {prompt_format}",
+            f"actual_prompt_text_head: {prompt_head!r}",
+            f"actual_prompt_text_tail: {prompt_tail!r}",
+            f"crop_start: {crop_start}",
+            f"effective_crop_start: {effective_crop_start}",
+            f"max_length: {max_length}",
+            f"required_ctx: {required_ctx}",
+            f"n_ctx: {n_ctx}",
+            f"total_tokens: {total_tokens}",
+            f"valid_len: {valid_len}",
+            f"pre_crop_embedding_shape: {pre_crop_embedding_shape}",
+            f"post_crop_ctxt_shape: {ctxt_raw.shape}",
+            f"ctxt_length: {ctxt_length.tolist()}",
+            f"vtxt_raw.shape: {vtxt_raw.shape}",
+            f"adapter_note: {adapter_note}",
+            f"hidden_size: {hidden_size}",
+            f"hidden_size_adapter: {hidden_size_adapter}",
+            f"n_batch: {getattr(llm, 'n_batch', None)}",
+            f"n_gpu_layers: {getattr(llm, 'n_gpu_layers', None)}",
+            f"main_gpu: {getattr(llm, 'main_gpu', None)}",
+            f"split_mode: {getattr(llm, 'split_mode', None)}",
+            f"HF tokenizer token count: {hf_token_count}",
+            f"llama.cpp tokenizer token count: {llama_token_count}",
+            f"token ids match: {token_ids_match}",
+            f"HF token ids head/tail: {hf_head} / {hf_tail}",
+            f"llama token ids head/tail: {llama_head} / {llama_tail}",
+        ]
+        print("\n".join(debug_lines))
         return (HYMotionConditioning(vtxt_raw, ctxt_raw, ctxt_length, text_list),)
 # ============================================================================
 # Node 4: HYMotion Generate
