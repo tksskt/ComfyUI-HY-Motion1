@@ -1705,6 +1705,16 @@ class HYMotionLoadLLMLlamaCppExperimental:
         if tokenizer_dir in (None, "") or not str(tokenizer_dir).strip():
             tokenizer_dir = os.path.join(HYMOTION_MODELS_DIR, "ckpts", "Qwen3-8B")
         tokenizer_dir = os.path.abspath(os.path.expanduser(str(tokenizer_dir).strip()))
+        gguf_label = os.path.basename(gguf_path).lower()
+        tokenizer_label = tokenizer_dir.lower().replace("\\", "/")
+        qwen35_gguf = any(tag in gguf_label for tag in ("qwen3.5", "qwen3_5", "qwen3-5"))
+        qwen3_8b_tokenizer = "qwen3-8b" in tokenizer_label
+        if qwen35_gguf and qwen3_8b_tokenizer:
+            print(
+                "[HY-Motion] WARNING: Qwen3.5 GGUF appears to be using tokenizer_dir for Qwen3-8B. "
+                "This keeps the HY-Motion training tokenizer default, but special tokens/chat template may differ. "
+                "Set tokenizer_dir to a matching Qwen3.5 tokenizer if token ids do not match."
+            )
         print(f"[HY-Motion] Loading llama.cpp HF tokenizer only: {tokenizer_dir}")
         try:
             tokenizer = AutoTokenizer.from_pretrained(
@@ -2122,6 +2132,7 @@ class HYMotionEncodeTextLlamaCppExperimental:
                 "device": (_get_device_choices(), {"default": "default"}),
                 "prompt_format": (["hymotion_template", "direct"], {"default": "hymotion_template"}),
                 "hidden_size_adapter": (["strict_4096", "unsafe_zero_pad_2560_to_4096"], {"default": "strict_4096"}),
+                "n_batch_auto": ("BOOLEAN", {"default": True}),
             },
         }
 
@@ -2130,7 +2141,7 @@ class HYMotionEncodeTextLlamaCppExperimental:
     FUNCTION = "encode"
     CATEGORY = "HY-Motion/Conditioning"
 
-    def encode(self, llm, text: str, device="default", prompt_format="hymotion_template", hidden_size_adapter="strict_4096"):
+    def encode(self, llm, text: str, device="default", prompt_format="hymotion_template", hidden_size_adapter="strict_4096", n_batch_auto=True):
         from .hymotion.network.text_encoders.model_constants import PROMPT_TEMPLATE_ENCODE_HUMAN_MOTION
 
         backend_name = getattr(llm, "backend_name", None)
@@ -2193,6 +2204,21 @@ class HYMotionEncodeTextLlamaCppExperimental:
         torch.cuda.empty_cache()
 
         tokenizer = getattr(llm, "tokenizer", None)
+        tokenizer_dir = getattr(llm, "tokenizer_dir", None)
+        gguf_path = getattr(llm, "gguf_path", "") or ""
+        gguf_label = os.path.basename(str(gguf_path)).lower()
+        tokenizer_label = str(tokenizer_dir or "").lower().replace("\\", "/")
+        qwen35_gguf = any(tag in gguf_label for tag in ("qwen3.5", "qwen3_5", "qwen3-5"))
+        qwen3_8b_tokenizer = "qwen3-8b" in tokenizer_label
+        tokenizer_family_note = "none"
+        if qwen35_gguf and qwen3_8b_tokenizer:
+            tokenizer_family_note = "qwen3.5_gguf_with_qwen3-8b_tokenizer"
+            print(
+                "[HY-Motion] WARNING: Qwen3.5 GGUF appears to be using tokenizer_dir for Qwen3-8B. "
+                "This preserves the HY-Motion training-tokenizer default, but chat template/special token handling may differ. "
+                "If token ids differ, try a matching Qwen3.5 tokenizer_dir."
+            )
+
         crop_start = int(getattr(llm, "crop_start", 0) or 0)
         max_length = int(getattr(llm, "max_length", 512) or 512)
         if prompt_format == "hymotion_template":
@@ -2229,9 +2255,17 @@ class HYMotionEncodeTextLlamaCppExperimental:
             except Exception as e:
                 print(f"[HY-Motion] WARNING: HF tokenizer debug tokenization failed: {e}")
         try:
-            llama_token_ids = llama.tokenize(actual_prompt_text.encode("utf-8"))
+            try:
+                llama_token_ids = llama.tokenize(
+                    actual_prompt_text.encode("utf-8"),
+                    add_bos=False,
+                    special=True,
+                )
+            except TypeError:
+                llama_token_ids = llama.tokenize(actual_prompt_text.encode("utf-8"), special=True)
         except Exception as e:
             raise RuntimeError(f"[HY-Motion] llama.cpp tokenizer failed for prompt_format={prompt_format}: {e}") from e
+        llama_token_ids = [int(t) for t in llama_token_ids]
         llama_token_count = len(llama_token_ids)
         if llama_token_count <= 0:
             raise RuntimeError("[HY-Motion] llama.cpp tokenizer returned no tokens")
@@ -2241,21 +2275,63 @@ class HYMotionEncodeTextLlamaCppExperimental:
             )
         n_batch = int(getattr(llm, "n_batch", 0) or 0)
         if n_batch > 0 and llama_token_count > n_batch:
-            print(
-                f"[HY-Motion] WARNING: llama.cpp token_count={llama_token_count} exceeds n_batch={n_batch}. "
-                "llama.cpp may process this in smaller batches or raise internally."
+            auto_note = " n_batch_auto=True cannot resize an already-created llama.cpp context during Encode." if n_batch_auto else ""
+            raise RuntimeError(
+                f"[HY-Motion] llama.cpp token_count={llama_token_count} exceeds n_batch={n_batch}. "
+                f"Increase n_batch to at least {llama_token_count}, or reduce prompt length/system prompt. "
+                f"Note: Qwen3.5 may fail to create context with large n_batch.{auto_note}"
             )
         token_ids_match = (hf_token_ids == llama_token_ids) if hf_token_ids is not None else None
+        parity_warning = "none"
         if token_ids_match is False:
-            print("[HY-Motion] WARNING: HF tokenizer token ids and llama.cpp token ids differ for this prompt.")
+            parity_warning = "token_ids_differ_conditioning_parity_not_guaranteed"
+            print(
+                "[HY-Motion] WARNING: token ids differ; conditioning parity with Transformers HYMotionEncodeText is not guaranteed."
+            )
 
-        embed_result = llama.embed(actual_prompt_text, normalize=False, truncate=False, return_count=True)
+        embed_input_source = "text"
+        embed_attempt_notes = []
+        embed_token_ids = None
+        if hf_token_ids is not None:
+            embed_token_ids = hf_token_ids
+            embed_input_source = "hf_token_ids"
+        else:
+            embed_token_ids = llama_token_ids
+            embed_input_source = "llama_token_ids_special"
+
+        def _try_embed(candidate, source_name):
+            try:
+                result = llama.embed(candidate, normalize=False, truncate=False, return_count=True)
+                return result, source_name, None
+            except Exception as e:
+                return None, source_name, e
+
+        embed_result = None
+        token_embed_error = None
+        if embed_token_ids is not None:
+            embed_result, embed_input_source, token_embed_error = _try_embed(embed_token_ids, embed_input_source)
+            if embed_result is None:
+                embed_attempt_notes.append(f"{embed_input_source} failed: {type(token_embed_error).__name__}: {token_embed_error}")
+                wrapped_source = f"[{embed_input_source}]"
+                embed_result, embed_input_source, token_embed_error = _try_embed([embed_token_ids], wrapped_source)
+                if embed_result is None:
+                    embed_attempt_notes.append(f"{wrapped_source} failed: {type(token_embed_error).__name__}: {token_embed_error}")
+        if embed_result is None:
+            embed_input_source = "text_fallback"
+            if token_embed_error is not None:
+                print(
+                    "[HY-Motion] WARNING: llama.embed did not accept token id input; falling back to text input. "
+                    "If token ids differ, conditioning parity is not guaranteed."
+                )
+            embed_result = llama.embed(actual_prompt_text, normalize=False, truncate=False, return_count=True)
         if isinstance(embed_result, tuple) and len(embed_result) == 2:
             embeddings, total_tokens = embed_result
         else:
             embeddings = embed_result
             total_tokens = None
         embedding_array = np.asarray(embeddings, dtype=np.float32)
+        if embedding_array.ndim == 3 and embedding_array.shape[0] == 1:
+            embedding_array = embedding_array[0]
         if embedding_array.ndim == 1:
             raise RuntimeError(
                 "[HY-Motion] llama.cpp returned a single sequence embedding vector, not token-level embeddings. "
@@ -2289,6 +2365,11 @@ class HYMotionEncodeTextLlamaCppExperimental:
             print(
                 f"[HY-Motion] llama.cpp token count warning: tokenizer_count={llama_token_count}, "
                 f"embedding_rows={embedding_rows}; using total_tokens={total_tokens} for ctxt_length"
+            )
+        if token_ids_match is False and prompt_format == "hymotion_template" and embed_input_source != "hf_token_ids":
+            print(
+                "[HY-Motion] WARNING: token ids differ and embedding did not use HF token ids; "
+                "conditioning parity with Transformers HYMotionEncodeText is not guaranteed."
             )
 
         cropped = embedding_array[effective_crop_start:effective_crop_start + max_length]
@@ -2347,9 +2428,15 @@ class HYMotionEncodeTextLlamaCppExperimental:
             f"hidden_size: {hidden_size}",
             f"hidden_size_adapter: {hidden_size_adapter}",
             f"n_batch: {getattr(llm, 'n_batch', None)}",
+            f"n_batch_auto: {n_batch_auto}",
             f"n_gpu_layers: {getattr(llm, 'n_gpu_layers', None)}",
             f"main_gpu: {getattr(llm, 'main_gpu', None)}",
             f"split_mode: {getattr(llm, 'split_mode', None)}",
+            f"tokenizer_dir: {tokenizer_dir}",
+            f"tokenizer_family_note: {tokenizer_family_note}",
+            f"embed_input_source: {embed_input_source}",
+            f"embed_attempt_notes: {embed_attempt_notes}",
+            f"parity_warning: {parity_warning}",
             f"HF tokenizer token count: {hf_token_count}",
             f"llama.cpp tokenizer token count: {llama_token_count}",
             f"token ids match: {token_ids_match}",
@@ -2609,6 +2696,259 @@ class HYMotionPreview:
                         img[p[1]+dy, p[0]+dx] = [50, 50, 50]
         return img
 
+
+# ============================================================================
+# Node 5b: HYMotion Render Skeleton Video
+# ============================================================================
+
+class HYMotionRenderSkeletonVideo:
+    """Render keypoints3d as a 2D skeleton control-video image batch."""
+
+    BONES_22 = [
+        (0, 1), (1, 4), (4, 7), (7, 10),
+        (0, 2), (2, 5), (5, 8), (8, 11),
+        (0, 3), (3, 6), (6, 9), (9, 12), (12, 15),
+        (9, 13), (13, 16), (16, 18), (18, 20),
+        (9, 14), (14, 17), (17, 19), (19, 21),
+    ]
+
+    BONE_COLORS = [
+        (255, 64, 64), (255, 128, 64), (255, 192, 64), (255, 224, 64),
+        (64, 160, 255), (64, 112, 255), (96, 80, 255), (144, 80, 255),
+        (80, 255, 128), (80, 255, 192), (80, 224, 255), (80, 176, 255), (160, 224, 255),
+        (255, 96, 192), (255, 96, 144), (224, 64, 128), (192, 64, 128),
+        (96, 255, 96), (64, 224, 96), (64, 192, 128), (64, 160, 160),
+    ]
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "motion_data": ("HYMOTION_DATA",),
+                "width": ("INT", {"default": 576, "min": 64, "max": 4096, "step": 8}),
+                "height": ("INT", {"default": 1024, "min": 64, "max": 4096, "step": 8}),
+                "fps": ("INT", {"default": 30, "min": 1, "max": 120}),
+                "line_thickness": ("INT", {"default": 4, "min": 1, "max": 32}),
+                "point_radius": ("INT", {"default": 5, "min": 1, "max": 32}),
+                "camera": (["front", "side", "auto"], {"default": "front"}),
+                "normalize": ("BOOLEAN", {"default": True}),
+                "center_body": ("BOOLEAN", {"default": True}),
+                "output_format": (["images", "video_components"], {"default": "images"}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("images", "debug")
+    FUNCTION = "render"
+    CATEGORY = "HY-Motion"
+
+    def render(self, motion_data: HYMotionData, width=576, height=1024, fps=30,
+               line_thickness=4, point_radius=5, camera="front", normalize=True,
+               center_body=True, output_format="images"):
+        width = int(width)
+        height = int(height)
+        line_thickness = int(line_thickness)
+        point_radius = int(point_radius)
+        fps = int(fps)
+
+        kpts = motion_data.output_dict.get("keypoints3d")
+        if kpts is None:
+            images = torch.zeros(1, height, width, 3, dtype=torch.float32)
+            debug = self._debug_text(0, 0, tuple(images.shape), fps, camera, camera, output_format,
+                                     "keypoints3d missing")
+            print(debug)
+            return (images, debug)
+
+        kpts_np = self._to_numpy(kpts)
+        input_shape = tuple(kpts_np.shape)
+        if kpts_np.ndim == 4:
+            sample = kpts_np[0]
+        elif kpts_np.ndim == 3:
+            sample = kpts_np
+        else:
+            images = torch.zeros(1, height, width, 3, dtype=torch.float32)
+            debug = self._debug_text(0, 0, tuple(images.shape), fps, camera, camera, output_format,
+                                     f"unsupported keypoints3d shape: {input_shape}")
+            print(debug)
+            return (images, debug)
+
+        if sample.shape[0] <= 0 or sample.shape[1] <= 0:
+            images = torch.zeros(1, height, width, 3, dtype=torch.float32)
+            debug = self._debug_text(0, 0, tuple(images.shape), fps, camera, camera, output_format,
+                                     f"empty keypoints3d shape: {input_shape}")
+            print(debug)
+            return (images, debug)
+        if sample.shape[2] < 3:
+            images = torch.zeros(1, height, width, 3, dtype=torch.float32)
+            debug = self._debug_text(0, 0, tuple(images.shape), fps, camera, camera, output_format,
+                                     f"keypoints3d must have xyz coordinates: {input_shape}")
+            print(debug)
+            return (images, debug)
+
+        joints3d = sample[:, :min(22, sample.shape[1]), :3].astype(np.float32, copy=False)
+        frame_count = int(joints3d.shape[0])
+        joints_count = int(joints3d.shape[1])
+        resolved_camera = self._resolve_camera(camera, joints3d)
+        projected = self._project(joints3d, resolved_camera)
+        pixels = self._fit_to_canvas(projected, width, height, normalize, center_body)
+
+        frames = [
+            self._draw_frame(pixels[i], width, height, line_thickness, point_radius)
+            for i in range(frame_count)
+        ]
+        images = torch.from_numpy(np.stack(frames, axis=0)).float() / 255.0
+        note = None
+        if output_format == "video_components":
+            note = "video_components output is not available in this package; returning IMAGE batch"
+        debug = self._debug_text(frame_count, joints_count, tuple(images.shape), fps, camera,
+                                 resolved_camera, output_format, note)
+        print(debug)
+        return (images, debug)
+
+    def _to_numpy(self, value):
+        if hasattr(value, "detach"):
+            return value.detach().cpu().numpy()
+        if hasattr(value, "cpu"):
+            return value.cpu().numpy()
+        return np.asarray(value)
+
+    def _resolve_camera(self, camera, joints3d):
+        if camera in ("front", "side"):
+            return camera
+        range_x = self._finite_range(joints3d[..., 0])
+        range_z = self._finite_range(joints3d[..., 2])
+        if range_z > range_x * 1.15:
+            return "side"
+        return "front"
+
+    def _finite_range(self, values):
+        finite = np.isfinite(values)
+        if not np.any(finite):
+            return 0.0
+        finite_values = values[finite]
+        return float(np.max(finite_values) - np.min(finite_values))
+
+    def _project(self, joints3d, camera):
+        horizontal_axis = 2 if camera == "side" else 0
+        horizontal = joints3d[..., horizontal_axis]
+        vertical = joints3d[..., 1]
+        return np.stack([horizontal, vertical], axis=-1).astype(np.float32, copy=False)
+
+    def _fit_to_canvas(self, points2d, width, height, normalize, center_body):
+        points = points2d.copy()
+        if center_body:
+            centers = self._body_centers(points)
+            points -= centers[:, None, :]
+
+        finite = np.isfinite(points).all(axis=-1)
+        if not np.any(finite):
+            return np.zeros_like(points)
+
+        valid_points = points[finite]
+        if normalize:
+            mins = valid_points.min(axis=0)
+            maxs = valid_points.max(axis=0)
+            extents = np.maximum(maxs - mins, 1e-5)
+            scale = min((width * 0.82) / extents[0], (height * 0.86) / extents[1])
+            center = (mins + maxs) * 0.5
+        else:
+            scale = min(width, height) * 0.35
+            center = np.array([0.0, 0.0], dtype=np.float32)
+            if not center_body:
+                mins = valid_points.min(axis=0)
+                maxs = valid_points.max(axis=0)
+                center = (mins + maxs) * 0.5
+
+        pixels = points.copy()
+        pixels[..., 0] = (points[..., 0] - center[0]) * scale + width * 0.5
+        pixels[..., 1] = height * 0.5 - (points[..., 1] - center[1]) * scale
+        return pixels
+
+    def _body_centers(self, points):
+        centers = np.zeros((points.shape[0], 2), dtype=np.float32)
+        for i in range(points.shape[0]):
+            frame = points[i]
+            candidates = []
+            for joint_idx in (0, 1, 2):
+                if joint_idx < frame.shape[0] and np.isfinite(frame[joint_idx]).all():
+                    candidates.append(frame[joint_idx])
+            if candidates:
+                centers[i] = np.mean(np.stack(candidates, axis=0), axis=0)
+            else:
+                finite = np.isfinite(frame).all(axis=-1)
+                if np.any(finite):
+                    centers[i] = frame[finite].mean(axis=0)
+        return centers
+
+    def _draw_frame(self, points, width, height, line_thickness, point_radius):
+        img = np.zeros((height, width, 3), dtype=np.uint8)
+        for idx, (a, b) in enumerate(self.BONES_22):
+            if a < len(points) and b < len(points):
+                p1 = points[a]
+                p2 = points[b]
+                if np.isfinite(p1).all() and np.isfinite(p2).all():
+                    self._draw_line(img, p1, p2, self.BONE_COLORS[idx % len(self.BONE_COLORS)],
+                                    line_thickness)
+
+        for pnt in points:
+            if np.isfinite(pnt).all():
+                self._draw_disk(img, int(round(pnt[0])), int(round(pnt[1])), point_radius, (255, 255, 255))
+        return img
+
+    def _draw_line(self, img, p1, p2, color, thickness):
+        x1, y1 = float(p1[0]), float(p1[1])
+        x2, y2 = float(p2[0]), float(p2[1])
+        radius = max(float(thickness) * 0.5, 0.5)
+        x_min = max(int(np.floor(min(x1, x2) - radius)), 0)
+        x_max = min(int(np.ceil(max(x1, x2) + radius)) + 1, img.shape[1])
+        y_min = max(int(np.floor(min(y1, y2) - radius)), 0)
+        y_max = min(int(np.ceil(max(y1, y2) + radius)) + 1, img.shape[0])
+        if x_min >= x_max or y_min >= y_max:
+            return
+
+        yy, xx = np.mgrid[y_min:y_max, x_min:x_max]
+        dx = x2 - x1
+        dy = y2 - y1
+        length_sq = dx * dx + dy * dy
+        if length_sq <= 1e-6:
+            self._draw_disk(img, int(round(x1)), int(round(y1)), max(1, int(round(radius))), color)
+            return
+
+        t = ((xx - x1) * dx + (yy - y1) * dy) / length_sq
+        t = np.clip(t, 0.0, 1.0)
+        proj_x = x1 + t * dx
+        proj_y = y1 + t * dy
+        mask = (xx - proj_x) ** 2 + (yy - proj_y) ** 2 <= radius ** 2
+        img[y_min:y_max, x_min:x_max][mask] = color
+
+    def _draw_disk(self, img, cx, cy, radius, color):
+        radius = max(int(radius), 1)
+        x_min = max(cx - radius, 0)
+        x_max = min(cx + radius + 1, img.shape[1])
+        y_min = max(cy - radius, 0)
+        y_max = min(cy + radius + 1, img.shape[0])
+        if x_min >= x_max or y_min >= y_max:
+            return
+
+        yy, xx = np.ogrid[y_min:y_max, x_min:x_max]
+        mask = (xx - cx) ** 2 + (yy - cy) ** 2 <= radius * radius
+        img[y_min:y_max, x_min:x_max][mask] = color
+
+    def _debug_text(self, frame_count, joints_count, output_shape, fps, camera, resolved_camera,
+                    output_format, note=None):
+        lines = [
+            "[HY-Motion] Render Skeleton Video debug",
+            f"frame_count: {frame_count}",
+            f"joints_count: {joints_count}",
+            f"output_shape: {output_shape}",
+            f"fps: {fps}",
+            f"camera: {camera}",
+            f"resolved_camera: {resolved_camera}",
+            f"output_format: {output_format}",
+        ]
+        if note:
+            lines.append(f"note: {note}")
+        return "\n".join(lines)
 
 # ============================================================================
 # Node 6: HYMotion Save NPZ
@@ -2985,6 +3325,7 @@ NODE_CLASS_MAPPINGS = {
     "HYMotionEncodeText": HYMotionEncodeText,
     "HYMotionGenerate": HYMotionGenerate,
     "HYMotionPreview": HYMotionPreview,
+    "HYMotionRenderSkeletonVideo": HYMotionRenderSkeletonVideo,
     "HYMotionSaveNPZ": HYMotionSaveNPZ,
     "HYMotionExportFBX": HYMotionExportFBX,
     "HYMotionPreviewAnimation": HYMotionPreviewAnimation,
@@ -3002,6 +3343,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "HYMotionEncodeText": "HY-Motion Encode Text",
     "HYMotionGenerate": "HY-Motion Generate",
     "HYMotionPreview": "HY-Motion Preview",
+    "HYMotionRenderSkeletonVideo": "HY-Motion Render Skeleton Video",
     "HYMotionSaveNPZ": "HY-Motion Save NPZ",
     "HYMotionExportFBX": "HY-Motion Export FBX",
     "HYMotionPreviewAnimation": "HY-Motion Preview Animation (3D)",
